@@ -1,0 +1,9 @@
+# Local dev artifacts — never commit
+devdata/
+*.log
+.env
+
+# Build/test outputs
+dist/
+*.test
+coverage.out
