@@ -39,6 +39,7 @@ manageable first release.
 | D | Interrupted deliveries | Jobs whose 10-minute claim lease expires are reclaimed and retried (a worker crash used to strand them forever). N workers run per config, and shutdown drains the queue for up to 30 s. |
 | E | Suppression list | A suppressed recipient is skipped and reported per recipient instead of aborting the whole message; all-suppressed refuses. One malformed address still rejects the whole message. |
 | F | Bounce-pause volume | The breaker's denominator is completed attempts recorded as DSNs, with hard bounces keyed on the DSN `is_hard` flag — queued/deferred jobs no longer inflate the denominator. |
+| G | Bounce-pause accounting | A hard bounce is recorded and counted under a row lock on the mailbox, so concurrent workers count attempts one after another. Without the lock two workers could each miss the other's uncommitted DSN and both skip the pause. |
 
 ### Explicitly still pending
 

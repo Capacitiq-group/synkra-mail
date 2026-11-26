@@ -285,17 +285,34 @@ func (s *stack) newAppPassword(t *testing.T, user *model.User, name string) stri
 	return secret
 }
 
+// drainWorker ticks the harness worker until every delivery job has reached a
+// terminal state (nothing queued, deferred or in flight).
 func (s *stack) drainWorker(t *testing.T) {
+	t.Helper()
+	s.drainWith(t, s.worker, uuid.Nil)
+}
+
+// drainWith ticks w until no delivery job is queued, deferred or in flight;
+// mailboxID narrows that to one mailbox's jobs (uuid.Nil: every job). A job
+// another worker has claimed still counts until that worker finishes it, so
+// state derived on completion (DSNs, the breaker) is settled when this returns.
+func (s *stack) drainWith(t *testing.T, w *outbound.Worker, mailboxID uuid.UUID) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := s.worker.Tick(ctx); err != nil {
+		if err := w.Tick(ctx); err != nil {
 			t.Fatalf("worker tick: %v", err)
 		}
 		var n int
-		if err := s.st.Pool.QueryRow(ctx, `select count(*) from mail.delivery_job where status in ('queued','deferred','in_flight')`).Scan(&n); err != nil {
+		var err error
+		if mailboxID == uuid.Nil {
+			err = s.st.Pool.QueryRow(ctx, `select count(*) from mail.delivery_job where status in ('queued','deferred','in_flight')`).Scan(&n)
+		} else {
+			err = s.st.Pool.QueryRow(ctx, `select count(*) from mail.delivery_job where mailbox_id=$1 and status in ('queued','deferred','in_flight')`, mailboxID).Scan(&n)
+		}
+		if err != nil {
 			t.Fatalf("queue depth: %v", err)
 		}
 		if n == 0 {
@@ -741,13 +758,14 @@ func TestBounceBreakerAndSuppression(t *testing.T) {
 			t.Fatalf("compose %d: %v", i, err)
 		}
 	}
-	for i := 0; i < 3; i++ {
-		if err := w.Tick(ctx); err != nil {
-			t.Fatalf("tick: %v", err)
-		}
-	}
-
+	// The harness's background worker polls every 50 ms and may claim some of
+	// these jobs while they are being composed, then still be mid-delivery when
+	// Tick returns. The breaker counts completed attempts only, so wait for all
+	// of them to finish before reading the mailbox. Either worker's transport
+	// is a hard bounce here: the test worker answers 550, the loopback 554.
 	mb, _ := s.ownMailbox(user)
+	s.drainWith(t, w, mb.ID)
+
 	fresh, _ := store.GetMailbox(ctx, s.st.Pool, mb.ID)
 	if fresh.SendStatus != "paused_bounces" {
 		t.Fatalf("mailbox send_status = %q, want paused_bounces", fresh.SendStatus)

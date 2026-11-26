@@ -83,6 +83,15 @@ func SetMailboxSendStatus(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID, s
 	return err
 }
 
+// LockMailboxRow takes a row lock on the mailbox for the rest of the
+// transaction. Hard bounces are counted inside the bouncing transaction, and
+// under READ COMMITTED two workers bouncing for the same mailbox at once would
+// each miss the other's uncommitted DSN and each see one attempt too few.
+func LockMailboxRow(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `select 1 from mail.mailbox where id=$1 for update`, mailboxID)
+	return err
+}
+
 func DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID) error {
 	// Hard delete is admin-only and audited (Section 11.1); ordinary deletion moves to Trash.
 	_, err := tx.Exec(ctx, `delete from mail.mailbox where id=$1`, mailboxID)

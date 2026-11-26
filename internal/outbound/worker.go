@@ -221,6 +221,12 @@ func (w *Worker) deferJob(ctx context.Context, j *model.DeliveryJob, attempts in
 
 func (w *Worker) hardBounce(ctx context.Context, j *model.DeliveryJob, org *model.Org, code int, msg string) error {
 	err := w.Pipeline.Store.WithTx(ctx, func(tx store.Tx) error {
+		// One hard bounce per mailbox at a time: the breaker counts completed
+		// attempts inside this transaction, and READ COMMITTED would let two
+		// workers each miss the other's uncommitted DSN and both skip a trip.
+		if err := store.LockMailboxRow(ctx, tx, j.MailboxID); err != nil {
+			return err
+		}
 		if err := store.BounceJob(ctx, tx, j.ID, j.Attempts+1, fmt.Sprintf("%d", code), msg); err != nil {
 			return err
 		}
