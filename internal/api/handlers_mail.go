@@ -116,7 +116,7 @@ func (s *Server) handleCreateAppPassword(w http.ResponseWriter, r *http.Request)
 		Name string `json:"name"`
 	}
 	if err := decodeJSON(r, &req); err != nil || strings.TrimSpace(req.Name) == "" {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "name required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "name required")
 		return
 	}
 	secret, ap, err := s.Auth.CreateAppPassword(r.Context(), ac, req.Name)
@@ -138,7 +138,7 @@ func (s *Server) handleRevokeAppPassword(w http.ResponseWriter, r *http.Request)
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.AppPassword)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	if err := s.Auth.RevokeAppPassword(r.Context(), ac, id); err != nil {
@@ -158,7 +158,7 @@ func (s *Server) handleListFolders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "mailbox_id required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "mailbox_id required")
 		return
 	}
 	folders, err := store.ListFolders(r.Context(), s.Store.Pool, mb.ID)
@@ -176,12 +176,12 @@ func (s *Server) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		Name      string `json:"name"`
 	}
 	if err := decodeJSON(r, &req); err != nil || req.Name == "" {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "name required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "name required")
 		return
 	}
 	mbID, ok := parseIDParam(req.MailboxID, ids.Mailbox)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad mailbox_id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad mailbox_id")
 		return
 	}
 	if acc, err := store.MailboxAccess(r.Context(), s.Store.Pool, ac.User.ID, mbID); err != nil || !acc {
@@ -203,7 +203,7 @@ func (s *Server) handleDeleteFolder(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Folder)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	folder, err := store.GetFolder(r.Context(), s.Store.Pool, id)
@@ -231,7 +231,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	folderID, ok := parseIDParam(r.URL.Query().Get("folder_id"), ids.Folder)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "folder_id required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "folder_id required")
 		return
 	}
 	folder, err := store.GetFolder(r.Context(), s.Store.Pool, folderID)
@@ -262,7 +262,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Message)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	full, err := store.GetMessage(r.Context(), s.Store.Pool, id)
@@ -293,7 +293,7 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Message)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	full, err := store.GetMessage(r.Context(), s.Store.Pool, id)
@@ -322,14 +322,14 @@ func (s *Server) handleSetFlags(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Message)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	var req struct {
 		Flags []string `json:"flags"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
 		return
 	}
 	full, err := store.GetMessage(r.Context(), s.Store.Pool, id)
@@ -359,19 +359,19 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Message)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	var req struct {
 		FolderID string `json:"folder_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
 		return
 	}
 	destID, ok := parseIDParam(req.FolderID, ids.Folder)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad folder_id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad folder_id")
 		return
 	}
 	full, err := store.GetMessage(r.Context(), s.Store.Pool, id)
@@ -389,7 +389,7 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if dest.MailboxID != full.Message.MailboxID {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "destination folder in another mailbox")
+		writeError(w, http.StatusBadRequest, "invalid_request", "destination folder in another mailbox")
 		return
 	}
 	var newUID uint32
@@ -409,7 +409,7 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Message)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	full, err := store.GetMessage(r.Context(), s.Store.Pool, id)
@@ -455,6 +455,9 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
+	// Cap the request one message above the plan's message cap: the JSON
+	// envelope and its attachments must fit both here and on the wire.
+	r.Body = http.MaxBytesReader(w, r.Body, s.Cfg.MaxMessageBytes+(1<<20))
 	var req struct {
 		From        string          `json:"from"`
 		To          []mimeutil.Addr `json:"to"`
@@ -468,7 +471,12 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		Attachments []mimeutil.Att  `json:"attachments"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad body")
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, "message_too_large", "request body exceeds the message size limit")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
 		return
 	}
 	if req.From == "" {
@@ -576,7 +584,7 @@ func (s *Server) handleMessageTracking(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Message)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	full, err := store.GetMessage(r.Context(), s.Store.Pool, id)
@@ -609,14 +617,14 @@ func (s *Server) handleThreadNote(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Thread)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	var req struct {
 		Note string `json:"note"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
 		return
 	}
 	// Internal notes are never transmitted — they live on the thread row only.
@@ -636,19 +644,19 @@ func (s *Server) handleThreadAssign(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Thread)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	var req struct {
 		AssigneeID string `json:"assignee_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
 		return
 	}
 	assignee, ok := parseIDParam(req.AssigneeID, ids.User)
 	if req.AssigneeID != "" && !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad assignee_id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad assignee_id")
 		return
 	}
 	err := s.Store.WithTx(r.Context(), func(tx store.Tx) error {
@@ -706,7 +714,7 @@ func (s *Server) handleCreateAddress(w http.ResponseWriter, r *http.Request) {
 		ForwardTarget string `json:"forward_target"`
 	}
 	if err := decodeJSON(r, &req); err != nil || req.Local == "" {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "local required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "local required")
 		return
 	}
 	if req.Kind == "" {
@@ -727,7 +735,7 @@ func (s *Server) handleCreateAddress(w http.ResponseWriter, r *http.Request) {
 	}
 	domID, ok := parseIDParam(req.DomainID, ids.Domain)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad domain_id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad domain_id")
 		return
 	}
 	dom, err := store.GetDomain(r.Context(), s.Store.Pool, domID)
@@ -737,7 +745,7 @@ func (s *Server) handleCreateAddress(w http.ResponseWriter, r *http.Request) {
 	}
 	mbID, ok := parseIDParam(req.MailboxID, ids.Mailbox)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad mailbox_id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad mailbox_id")
 		return
 	}
 	if acc, aerr := store.MailboxAccess(r.Context(), s.Store.Pool, ac.User.ID, mbID); aerr != nil || !acc {
@@ -770,7 +778,7 @@ func (s *Server) handleDeleteAddress(w http.ResponseWriter, r *http.Request) {
 	}
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Address)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	err := s.Store.WithTx(r.Context(), func(tx store.Tx) error {
@@ -799,7 +807,7 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 	if err := decodeJSON(r, &req); err != nil || !strings.Contains(req.Name, ".") {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "valid domain name required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "valid domain name required")
 		return
 	}
 	d := &model.Domain{ID: uuid.New(), OrgID: &ac.User.OrgID, Name: strings.ToLower(strings.TrimSpace(req.Name)), Status: "pending"}
@@ -826,7 +834,7 @@ func (s *Server) handleVerifyDomain(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Domain)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	dom, err := store.GetDomain(r.Context(), s.Store.Pool, id)
@@ -862,7 +870,7 @@ func (s *Server) handleDomainDNS(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Domain)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad id")
 		return
 	}
 	dom, err := store.GetDomain(r.Context(), s.Store.Pool, id)
@@ -873,10 +881,13 @@ func (s *Server) handleDomainDNS(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"domain": dom.Name,
 		"records": []map[string]string{
-			{"type": "MX", "name": "@", "value": "10 mx1.synkra.co.za", "purpose": "receive"},
-			{"type": "TXT", "name": "@", "value": "v=spf1 include:spf.synkra.email ~all", "purpose": "SPF"},
+			{"type": "MX", "name": "@", "value": "10 " + s.Cfg.Hostname, "purpose": "receive"},
+			{"type": "TXT", "name": "@", "value": "v=spf1 include:spf." + s.Cfg.PlatformDomain + " ~all", "purpose": "SPF"},
 			{"type": "TXT", "name": dom.DKIMSelector + "._domainkey", "value": dom.DKIMPublicTXT, "purpose": "DKIM"},
-			{"type": "TXT", "name": "_dmarc", "value": "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@synkra.email", "purpose": "DMARC"},
+			{"type": "TXT", "name": "_dmarc", "value": "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@" + s.Cfg.PlatformDomain, "purpose": "DMARC"},
+			// RFC 7489 7.1: reports to an external receiver must be authorised
+			// by this record in the customer's zone, or every report is dropped.
+			{"type": "TXT", "name": s.Cfg.PlatformDomain + "._domainkey", "value": "v=DMARC1", "purpose": "DMARC report authorisation"},
 			{"type": "TXT", "name": "@", "value": dom.OwnershipToken, "purpose": "ownership verification"},
 		},
 	})
@@ -909,11 +920,15 @@ func (s *Server) handleSetTracking(w http.ResponseWriter, r *http.Request) {
 		Enabled bool `json:"enabled"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
 		return
 	}
 	err := s.Store.WithTx(r.Context(), func(tx store.Tx) error {
-		_, err := tx.Exec(r.Context(), `update mail.org set tracking_enabled=$2, updated_at=now() where id=$1`, ac.User.OrgID, req.Enabled)
+		// tracking_started_at: first enable wins — auditable from when
+		// tracking actually began (Section 9.4).
+		_, err := tx.Exec(r.Context(), `update mail.org set tracking_enabled=$2,
+			tracking_started_at = case when $2 and tracking_started_at is null then now() else tracking_started_at end,
+			updated_at=now() where id=$1`, ac.User.OrgID, req.Enabled)
 		return err
 	})
 	if err != nil {
@@ -937,7 +952,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		Password    string `json:"password"`
 	}
 	if err := decodeJSON(r, &req); err != nil || req.Email == "" || req.Password == "" {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "email and password required")
+		writeError(w, http.StatusBadRequest, "invalid_request", "email and password required")
 		return
 	}
 	plan, err := store.GetPlanByID(r.Context(), s.Store.Pool, ac.Org.PlanID)

@@ -26,6 +26,9 @@ var (
 	ErrSendingDisabled = errors.New("sending not enabled: payment or admin approval required")
 	ErrMailboxFull     = errors.New("mailbox full: storage grace buffer exhausted")
 	ErrLimitExceeded   = errors.New("sending limit exceeded")
+	ErrNoRecipients    = errors.New("no recipients")
+	ErrInvalidAddress  = errors.New("invalid address")
+	ErrMessageTooLarge = errors.New("message exceeds the size limit")
 )
 
 // Transport delivers one message to one recipient. Loopback (dev/tests) and
@@ -58,7 +61,9 @@ type ComposeInput struct {
 	InReplyTo   string
 	References  []string
 	Attachments []mimeutil.Att
-	Track       bool // per-message opt-in (compose UI shows a disclosure — Section 9.4)
+	// Date is the submission time (InternalDate of the Sent copy); zero = now.
+	Date  time.Time
+	Track bool // per-message opt-in (compose UI shows a disclosure — Section 9.4)
 }
 
 // RecipientView is the API response: what happened per recipient.
@@ -68,12 +73,22 @@ type RecipientView struct {
 	Queued     bool   `json:"queued"`
 }
 
+// admitted carries what admission decided into the storage step: the built
+// raw message, its Message-ID, the tracking rows to create and the suppressed
+// set (skipped recipients — reported, not fatal).
+type admitted struct {
+	raw        []byte
+	messageID  string
+	track      *pendingTrack
+	suppressed map[string]bool
+}
+
 // ComposeAndQueue: full submission path from the webmail API.
 func (p *Pipeline) ComposeAndQueue(ctx context.Context, userID, orgID uuid.UUID, in ComposeInput) (messageID uuid.UUID, recipients []RecipientView, err error) {
 	// From ownership (Section 7.4.2): own mailbox, team membership, or alias routed to them.
 	local, domain, serr := splitAddr(in.From.Email)
-	if serr != nil {
-		return uuid.Nil, nil, fmt.Errorf("invalid from address")
+	if serr != nil || !mimeutil.ValidAddress(in.From.Email) {
+		return uuid.Nil, nil, fmt.Errorf("%w: %q", ErrInvalidAddress, in.From.Email)
 	}
 	ok, err := store.SendAsOK(ctx, p.Store.Pool, userID, local, domain)
 	if err != nil {
@@ -87,17 +102,18 @@ func (p *Pipeline) ComposeAndQueue(ctx context.Context, userID, orgID uuid.UUID,
 		return uuid.Nil, nil, err
 	}
 
-	raw, msgID, pt, err := p.admissionAndBuild(ctx, fromMailbox, in)
+	adm, err := p.admissionAndBuild(ctx, fromMailbox, in)
 	if err != nil {
 		return uuid.Nil, nil, err
 	}
-
-	recipients, messageID, err = p.storeOutgoing(ctx, orgID, fromMailbox.ID, userID, raw, msgID, in, nil, pt)
+	recipients, messageID, err = p.storeOutgoing(ctx, orgID, fromMailbox.ID, userID, adm.raw, adm.messageID, in, nil, adm)
 	return messageID, recipients, err
 }
 
 // QueueSubmission handles messages arriving over the submission SMTP port —
-// the raw message is already built by the client.
+// the raw message is already built by the client. What the client wrote is
+// kept verbatim; only what it omitted (Message-ID, Date) is supplied, and
+// admission runs against the same rules as the webmail compose.
 func (p *Pipeline) QueueSubmission(ctx context.Context, userID, orgID uuid.UUID, raw []byte, envFrom string, rcpts []string) error {
 	parsed, err := mimeutil.Parse(raw)
 	if err != nil {
@@ -108,8 +124,8 @@ func (p *Pipeline) QueueSubmission(ctx context.Context, userID, orgID uuid.UUID,
 		fromEmail = envFrom
 	}
 	local, domain, serr := splitAddr(fromEmail)
-	if serr != nil {
-		return errors.New("5.1.7 bad sender address")
+	if serr != nil || !mimeutil.ValidAddress(fromEmail) {
+		return fmt.Errorf("%w: 5.1.7 bad sender address", ErrInvalidAddress)
 	}
 	ok, err := store.SendAsOK(ctx, p.Store.Pool, userID, local, domain)
 	if err != nil {
@@ -124,89 +140,152 @@ func (p *Pipeline) QueueSubmission(ctx context.Context, userID, orgID uuid.UUID,
 	}
 
 	in := ComposeInput{
-		From:    mimeutil.Addr{Email: fromEmail, Name: parsed.FromName},
-		Subject: parsed.Subject,
-		Text:    parsed.Text,
-		HTML:    parsed.HTML,
-		Track:   false, // submission clients don't get rewrites unless the org toggle + webmail path
+		From:        mimeutil.Addr{Email: fromEmail, Name: parsed.FromName},
+		To:          parsed.To,
+		Cc:          parsed.Cc,
+		Subject:     parsed.Subject,
+		Text:        parsed.Text,
+		HTML:        parsed.HTML,
+		InReplyTo:   parsed.InReplyTo,
+		References:  parsed.Refs,
+		Attachments: parsed.Attachments,
+		Date:        parsed.Date,
+		Track:       false, // submission clients don't get rewrites unless the org toggle + webmail path
 	}
-	for _, r := range rcpts {
-		in.To = append(in.To, mimeutil.Addr{Email: r})
+	// A client may name its recipients only in the envelope (Bcc only, or no
+	// recipient header at all). Those addresses are admitted as Bcc: envelope
+	// only, so the stored To stays what the client wrote and the message is
+	// not touched.
+	if len(parsed.To) == 0 && len(parsed.Cc) == 0 {
+		in.Bcc = make([]mimeutil.Addr, 0, len(rcpts))
+		for _, r := range dedupe(rcpts) {
+			in.Bcc = append(in.Bcc, mimeutil.Addr{Email: strings.TrimSpace(r)})
+		}
 	}
 	// The client's raw message is the deliverable (Sent copy + jobs reference it);
 	// admission re-uses the build path only for validation and tracking metadata.
-	_, _, pt, err := p.admissionAndBuild(ctx, fromMailbox, in)
+	adm, err := p.admissionAndBuild(ctx, fromMailbox, in)
 	if err != nil {
 		return err
 	}
-	_, _, err = p.storeOutgoing(ctx, orgID, fromMailbox.ID, userID, raw, parsed.MessageID, in, rcpts, pt)
+
+	// A message leaving without a Message-ID or Date breaks threading at the
+	// receiver (Section 4.2). What the client left out is supplied, prefixed
+	// to its headers; nothing it wrote is rewritten.
+	msgID := strings.TrimSpace(parsed.MessageID)
+	if msgID == "" {
+		msgID = mimeutil.NewMessageID(p.Cfg.Hostname)
+	}
+	var missing []mimeutil.Header
+	if !mimeutil.HasHeader(raw, "Message-ID") {
+		missing = append(missing, mimeutil.Header{Name: "Message-ID", Value: msgID})
+	}
+	if !mimeutil.HasHeader(raw, "Date") {
+		missing = append(missing, mimeutil.Header{Name: "Date", Value: time.Now().Format(time.RFC1123Z)})
+	}
+	raw = mimeutil.AddMissingHeaders(raw, missing...)
+
+	_, _, err = p.storeOutgoing(ctx, orgID, fromMailbox.ID, userID, raw, msgID, in, rcpts, adm)
 	return err
 }
 
 // admissionAndBuild: sending state, limits, suppression, tracking rewrite, MIME build.
-func (p *Pipeline) admissionAndBuild(ctx context.Context, fromMailbox *model.Mailbox, in ComposeInput) ([]byte, string, *pendingTrack, error) {
+func (p *Pipeline) admissionAndBuild(ctx context.Context, fromMailbox *model.Mailbox, in ComposeInput) (*admitted, error) {
 	org, err := store.GetOrg(ctx, p.Store.Pool, fromMailbox.OrgID)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, err
 	}
 
 	// Org suspension defers outbound (Section 7.1); storage-full blocks sending (Section 4.4).
 	if org.Status == "suspended" {
-		return nil, "", nil, ErrSendingPaused
+		return nil, ErrSendingPaused
 	}
 	qd := &ingest.Deps{Store: p.Store, Blobs: p.Blobs, Cfg: p.Cfg}
 	q, err := qd.CheckQuota(ctx, org.ID)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, err
 	}
 	if q.BeyondGrace {
-		return nil, "", nil, ErrMailboxFull
+		return nil, ErrMailboxFull
 	}
 
 	// Sending gate (owner decision): payment or admin approval, else no outbound.
 	state, err := store.ResolveSendingState(ctx, p.Store.Pool, org)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, err
 	}
 	if !state.Enabled {
-		return nil, "", nil, ErrSendingDisabled
+		return nil, ErrSendingDisabled
 	}
 	if fromMailbox.SendStatus != "active" {
-		return nil, "", nil, fmt.Errorf("%w (%s)", ErrSendingPaused, fromMailbox.SendStatus)
+		return nil, fmt.Errorf("%w (%s)", ErrSendingPaused, fromMailbox.SendStatus)
 	}
 
 	rcpts := gatherRecipients(in)
 	if len(rcpts) == 0 {
-		return nil, "", nil, errors.New("no recipients")
+		return nil, ErrNoRecipients
 	}
 	if len(rcpts) > p.Cfg.Limits.MaxRecipients {
-		return nil, "", nil, fmt.Errorf("%w: max %d recipients per message", ErrLimitExceeded, p.Cfg.Limits.MaxRecipients)
+		return nil, fmt.Errorf("%w: max %d recipients per message", ErrLimitExceeded, p.Cfg.Limits.MaxRecipients)
 	}
-
-	// Tiered limits (Section 7.3). Suppressed recipients are surfaced, not dropped silently.
-	if err := p.checkLimits(ctx, org, fromMailbox, len(rcpts)); err != nil {
-		return nil, "", nil, err
+	if !mimeutil.ValidAddress(in.From.Email) {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidAddress, in.From.Email)
 	}
 	for _, r := range rcpts {
-		sup, err := store.IsSuppressed(ctx, p.Store.Pool, org.ID, r)
-		if err == nil && sup {
-			return nil, "", nil, fmt.Errorf("%w: %s is suppressed (hard bounce or unsubscribe)", ErrLimitExceeded, r)
+		if !mimeutil.ValidAddress(r) {
+			return nil, fmt.Errorf("%w: %q", ErrInvalidAddress, r)
 		}
 	}
 
-	// Tracking (Section 9): org toggle + per-message opt-in; off by default.
-	track := in.Track && p.TrackEnabled != nil && p.TrackEnabled(ctx, org.ID)
-	if track {
-		raw, msgID, pt, terr := p.buildTracked(ctx, org, fromMailbox, in)
-		return raw, msgID, pt, terr
+	// Suppressed recipients (hard bounce or unsubscribe, Section 7.3) are
+	// skipped and reported instead of aborting the send: one poisoned address
+	// must not stop a message to thirty good ones. All suppressed = refuse.
+	suppressed := map[string]bool{}
+	sendable := make([]string, 0, len(rcpts))
+	for _, r := range rcpts {
+		sup, err := store.IsSuppressed(ctx, p.Store.Pool, org.ID, r)
+		if err != nil {
+			return nil, err
+		}
+		if sup {
+			suppressed[strings.ToLower(strings.TrimSpace(r))] = true
+			continue
+		}
+		sendable = append(sendable, r)
+	}
+	if len(sendable) == 0 {
+		return nil, fmt.Errorf("%w: every recipient is suppressed (hard bounce or unsubscribe)", ErrLimitExceeded)
 	}
 
-	raw, msgID, err := mimeutil.Build(mimeutil.ComposeInput{
-		From: in.From, To: in.To, Cc: in.Cc, Subject: in.Subject,
-		Text: in.Text, HTML: in.HTML, InReplyTo: in.InReplyTo, References: in.References,
-		Attachments: in.Attachments,
-	})
-	return raw, msgID, nil, err
+	// Tiered limits (Section 7.3) count recipients we will actually attempt.
+	if err := p.checkLimits(ctx, org, fromMailbox, len(sendable)); err != nil {
+		return nil, err
+	}
+
+	// Compose headers reflect what will actually be delivered.
+	in.To = withoutSuppressed(in.To, suppressed)
+	in.Cc = withoutSuppressed(in.Cc, suppressed)
+	in.Bcc = withoutSuppressed(in.Bcc, suppressed)
+
+	adm := &admitted{suppressed: suppressed}
+	// Tracking (Section 9): org toggle + per-message opt-in; off by default.
+	if in.Track && p.TrackEnabled != nil && p.TrackEnabled(ctx, org.ID) {
+		raw, msgID, pt, terr := p.buildTracked(ctx, org, fromMailbox, in)
+		if terr != nil {
+			return nil, terr
+		}
+		adm.raw, adm.messageID, adm.track = raw, msgID, pt
+	} else {
+		raw, msgID, berr := p.build(in)
+		if berr != nil {
+			return nil, berr
+		}
+		adm.raw, adm.messageID = raw, msgID
+	}
+	if int64(len(adm.raw)) > p.Cfg.MaxMessageBytes {
+		return nil, fmt.Errorf("%w (%d MB)", ErrMessageTooLarge, p.Cfg.MaxMessageBytes>>20)
+	}
+	return adm, nil
 }
 
 func (p *Pipeline) checkLimits(ctx context.Context, org *model.Org, fromMailbox *model.Mailbox, rcptCount int) error {
@@ -251,14 +330,24 @@ func (p *Pipeline) checkLimits(ctx context.Context, org *model.Org, fromMailbox 
 	return nil
 }
 
+func (p *Pipeline) build(in ComposeInput) ([]byte, string, error) {
+	return mimeutil.Build(mimeutil.ComposeInput{
+		From: in.From, To: in.To, Cc: in.Cc, Bcc: in.Bcc, Subject: in.Subject,
+		Text: in.Text, HTML: in.HTML, InReplyTo: in.InReplyTo, References: in.References,
+		Attachments: in.Attachments, Date: in.Date,
+		MessageIDDomain: p.Cfg.Hostname,
+	})
+}
+
 // buildTracked rewrites links + injects the pixel, creating tracking rows in the
 // same transaction as the message (tracker stays isolated — Section 9.1).
 func (p *Pipeline) buildTracked(ctx context.Context, org *model.Org, fromMailbox *model.Mailbox, in ComposeInput) ([]byte, string, *pendingTrack, error) {
 	pixelID := uuid.New()
 	raw, msgID, err := mimeutil.Build(mimeutil.ComposeInput{
-		From: in.From, To: in.To, Cc: in.Cc, Subject: in.Subject,
+		From: in.From, To: in.To, Cc: in.Cc, Bcc: in.Bcc, Subject: in.Subject,
 		Text: in.Text, HTML: in.HTML, InReplyTo: in.InReplyTo, References: in.References,
-		Attachments: in.Attachments,
+		Attachments: in.Attachments, Date: in.Date,
+		MessageIDDomain: p.Cfg.Hostname,
 	})
 	if err != nil {
 		return nil, "", nil, err
@@ -286,24 +375,28 @@ type pendingTrack struct {
 }
 
 // storeOutgoing: Sent copy + delivery_job rows, one transaction.
-func (p *Pipeline) storeOutgoing(ctx context.Context, orgID, fromMailboxID, userID uuid.UUID, raw []byte, msgID string, in ComposeInput, envRcpts []string, pt *pendingTrack) ([]RecipientView, uuid.UUID, error) {
+func (p *Pipeline) storeOutgoing(ctx context.Context, orgID, fromMailboxID, userID uuid.UUID, raw []byte, msgID string, in ComposeInput, envRcpts []string, adm *admitted) ([]RecipientView, uuid.UUID, error) {
 	sha, size, err := p.Blobs.Put(ctx, bytes.NewReader(raw))
 	if err != nil {
 		return nil, uuid.Nil, err
 	}
 
+	var suppressed map[string]bool
+	if adm != nil {
+		suppressed = adm.suppressed
+	}
+	held := func(r string) bool { return suppressed[strings.ToLower(strings.TrimSpace(r))] }
+
 	var envelopeRcpts []string
 	if envRcpts != nil {
-		envelopeRcpts = envRcpts
+		envelopeRcpts = dedupe(envRcpts)
 	} else {
-		for _, a := range in.To {
-			envelopeRcpts = append(envelopeRcpts, a.Email)
-		}
-		for _, a := range in.Cc {
-			envelopeRcpts = append(envelopeRcpts, a.Email)
-		}
-		for _, a := range in.Bcc {
-			envelopeRcpts = append(envelopeRcpts, a.Email)
+		envelopeRcpts = gatherRecipients(in) // suppression already removed from in
+	}
+	deliver := make([]string, 0, len(envelopeRcpts))
+	for _, rcpt := range envelopeRcpts {
+		if !held(rcpt) {
+			deliver = append(deliver, rcpt)
 		}
 	}
 
@@ -319,11 +412,17 @@ func (p *Pipeline) storeOutgoing(ctx context.Context, orgID, fromMailboxID, user
 			BlobSHA256: sha, Direction: "outbound",
 			MessageID: msgID, InReplyTo: in.InReplyTo, Refs: in.References,
 			FromEmail: in.From.Email, FromName: in.From.Name,
-			ToAddrs: toModelAddrs(in.To), CcAddrs: toModelAddrs(in.Cc),
+			ToAddrs: toModelAddrs(withoutSuppressed(in.To, suppressed)),
+			CcAddrs: toModelAddrs(withoutSuppressed(in.Cc, suppressed)),
 			Subject: in.Subject, Snippet: mimeutil.Snippet(in.Text), BodyText: in.Text,
 			HasAttachments: hasAttachments(in.Attachments), SizeBytes: size,
-			InternalDate: time.Now(), TrackingEnabled: pt != nil,
+			TrackingEnabled: adm != nil && adm.track != nil,
 		}
+		date := in.Date
+		if date.IsZero() {
+			date = time.Now()
+		}
+		msg.InternalDate = date
 		subjNorm := mimeutil.NormalizeSubject(in.Subject)
 		threadID, terr := store.FindOrCreateThread(ctx, tx, orgID, in.References, in.InReplyTo, subjNorm)
 		if terr != nil {
@@ -342,22 +441,27 @@ func (p *Pipeline) storeOutgoing(ctx context.Context, orgID, fromMailboxID, user
 			}
 			if aerr := store.InsertAttachment(ctx, tx, &model.Attachment{
 				ID: uuid.New(), MessageID: msg.ID, BlobSHA256: asha,
-				Filename: a.Filename, ContentType: a.ContentType, SizeBytes: asize, IsInline: a.IsInline,
+				Filename: a.Filename, ContentType: a.ContentType, SizeBytes: asize,
+				IsInline: a.IsInline, ContentID: a.ContentID,
 			}); aerr != nil {
 				return aerr
 			}
 		}
 
 		// Tracking rows (if this compose was tracked).
-		if pt != nil {
+		if adm != nil && adm.track != nil {
+			// The pixel names the sole recipient; with several recipients the
+			// pixel would leak who opened what, so it stays unattributed.
+			recipient := ""
+			if len(deliver) == 1 {
+				recipient = deliver[0]
+			}
 			if err := store.CreateTrackingPixel(ctx, tx, &model.TrackingPixel{
-				ID: pt.pixelID, MessageID: msg.ID, Recipient: in.From.Email,
+				ID: adm.track.pixelID, MessageID: msg.ID, Recipient: recipient,
 			}); err != nil {
 				return err
 			}
-			// Pixel recipient is rewritten per job below; one pixel per message
-			// (recipient-level pixels are a post-v1 refinement).
-			for target, lid := range pt.linkIDs {
+			for target, lid := range adm.track.linkIDs {
 				if err := store.CreateTrackedLink(ctx, tx, &model.TrackedLink{
 					ID: lid, MessageID: msg.ID, URL: target,
 				}); err != nil {
@@ -366,8 +470,8 @@ func (p *Pipeline) storeOutgoing(ctx context.Context, orgID, fromMailboxID, user
 			}
 		}
 
-		// One durable job per recipient (Section 5.2).
-		for _, rcpt := range envelopeRcpts {
+		// One durable job per recipient we will attempt (Section 5.2).
+		for _, rcpt := range deliver {
 			domain := rcptDomain(rcpt)
 			j := &model.DeliveryJob{
 				ID: uuid.New(), OrgID: orgID, MailboxID: fromMailboxID, MessageID: msg.ID,
@@ -376,7 +480,9 @@ func (p *Pipeline) storeOutgoing(ctx context.Context, orgID, fromMailboxID, user
 			if err := store.CreateDeliveryJob(ctx, tx, j); err != nil {
 				return err
 			}
-			views = append(views, RecipientView{Email: rcpt, Queued: true})
+		}
+		for _, rcpt := range envelopeRcpts {
+			views = append(views, RecipientView{Email: rcpt, Queued: !held(rcpt), Suppressed: held(rcpt)})
 		}
 		return nil
 	})
@@ -413,6 +519,36 @@ func gatherRecipients(in ComposeInput) []string {
 	add(in.To)
 	add(in.Cc)
 	add(in.Bcc)
+	return out
+}
+
+func withoutSuppressed(list []mimeutil.Addr, suppressed map[string]bool) []mimeutil.Addr {
+	if len(suppressed) == 0 || len(list) == 0 {
+		return list
+	}
+	out := make([]mimeutil.Addr, 0, len(list))
+	for _, a := range list {
+		if !suppressed[strings.ToLower(strings.TrimSpace(a.Email))] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func dedupe(list []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		e := strings.ToLower(strings.TrimSpace(s))
+		if e == "" {
+			continue
+		}
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		out = append(out, strings.TrimSpace(s))
+	}
 	return out
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Synkra Email build/dev environment. Source this in every shell:
-#   source /home/z/my-project/synkra-email/env.sh
+#   source /home/z/my-project/synkra-mail/env.sh
 export GOROOT=/home/z/my-project/tooling/go
 export PATH=$GOROOT/bin:$PATH
 export GOPATH=/home/z/my-project/tooling/gopath

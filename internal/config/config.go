@@ -18,6 +18,12 @@ type Config struct {
 
 	PlatformDomain string // synkra.email (owner decision: pending DNS verification)
 	TrackingHost   string // trk.synkra.email
+
+	// Hostname is THIS server's mail identity: the EHLO name, the bounce
+	// Reporting-MTA and the Message-ID domain, all in one knob. It must be a
+	// resolvable A/AAAA with matching PTR (FCrDNS) — the sending VPS's mail name.
+	Hostname string
+
 	TrackingSecret string // HMAC secret shared between mail core and the tracker (rotatable)
 
 	BlobMode string // fs | s3   (s3 adapter is the Stage-A production mode)
@@ -127,6 +133,9 @@ func Load() (*Config, error) {
 
 		PlatformDomain: envStr("SYNKRA_MAIL_PLATFORM_DOMAIN", "synkra.email"),
 		TrackingHost:   envStr("SYNKRA_MAIL_TRACKING_HOST", "trk.synkra.email"),
+		// Default follows the planned Stage-A VPS (mx1.synkra.email did not
+		// resolve at the 2026-11-25 DNS check; mx1.synkra.co.za does).
+		Hostname:       envStr("SYNKRA_MAIL_HOSTNAME", "mx1.synkra.co.za"),
 		TrackingSecret: envStr("SYNKRA_MAIL_TRACKING_SECRET", "dev-tracking-secret"),
 
 		BlobMode: envStr("SYNKRA_MAIL_BLOB_MODE", "fs"),
@@ -194,15 +203,24 @@ func Load() (*Config, error) {
 		SessionTTL:      envDur("SYNKRA_MAIL_SESSION_TTL", 14*24*time.Hour),
 		CookieName:      "synkra_mail_session",
 		CookieSecret:    envStr("SYNKRA_MAIL_COOKIE_SECRET", "dev-cookie-secret"),
-		LoginMaxFails:   10,
-		LoginWindow:     10 * time.Minute,
-		LoginLockoutDur: 15 * time.Minute,
+		LoginMaxFails:   envInt("SYNKRA_MAIL_LOGIN_MAX_FAILS", 10),
+		LoginWindow:     envDur("SYNKRA_MAIL_LOGIN_WINDOW", 10*time.Minute),
+		LoginLockoutDur: envDur("SYNKRA_MAIL_LOGIN_LOCKOUT", 15*time.Minute),
 		IMAPMaxConnUser: envInt("SYNKRA_MAIL_IMAP_MAX_CONN", 8),
 	}
 
 	c.DB.URL = os.Getenv("SYNKRA_MAIL_DATABASE_URL")
 	if c.DB.URL == "" {
 		return nil, fmt.Errorf("SYNKRA_MAIL_DATABASE_URL is required")
+	}
+
+	// One identity per machine, canonicalised: lowercase, no trailing dot
+	// (RFC 1035 2.3.1 — a trailing dot breaks HELO comparisons and PTR match).
+	c.Hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.Hostname)), ".")
+	c.PlatformDomain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.PlatformDomain)), ".")
+	c.TrackingHost = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.TrackingHost)), ".")
+	if c.Hostname == "" {
+		return nil, fmt.Errorf("SYNKRA_MAIL_HOSTNAME must not be empty")
 	}
 
 	if c.TrackingSecret == "dev-tracking-secret" || c.HTTP.CookieSecret == "dev-cookie-secret" {

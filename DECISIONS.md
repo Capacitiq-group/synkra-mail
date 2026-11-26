@@ -29,6 +29,17 @@ manageable first release.
   customer controls are fully defined; per-message opt-out; the tracking host
   is separate from the mailbox/login domain.
 
+### Engineering decisions from the 2026-11-25 audit (owner to confirm)
+
+| # | Topic | Decision implemented |
+|---|-------|----------------------|
+| A | Outbound TLS | Opportunistic but never silently downgraded: a certificate that fails verification gets exactly one unverified-TLS attempt (still encrypted); a host without STARTTLS is logged and used in cleartext; after a failed TLS handshake we never fall back to cleartext. |
+| B | Server identity | One knob, `SYNKRA_MAIL_HOSTNAME` (default `mx1.synkra.co.za`): EHLO name, bounce Reporting-MTA, Message-ID domain and the DNS-doctor MX target. (`mx1.synkra.email` did not resolve at the DNS check.) |
+| C | Retry schedule | Attempt N gets the Nth delay of the §5.2 table (1m … 48h); previously the first retry fired immediately. |
+| D | Interrupted deliveries | Jobs whose 10-minute claim lease expires are reclaimed and retried (a worker crash used to strand them forever). N workers run per config, and shutdown drains the queue for up to 30 s. |
+| E | Suppression list | A suppressed recipient is skipped and reported per recipient instead of aborting the whole message; all-suppressed refuses. One malformed address still rejects the whole message. |
+| F | Bounce-pause volume | The breaker's denominator is completed attempts recorded as DSNs, with hard bounces keyed on the DSN `is_hard` flag — queued/deferred jobs no longer inflate the denominator. |
+
 ### Explicitly still pending
 
 1. **S3 data-residency sign-off** (owner item 2) — cannot be self-approved.

@@ -50,7 +50,20 @@ The E2E suite (`internal/e2e`) covers: send→deliver loop, inbound SMTP routing
 the storage grace buffer (552), new-org sending limits, the 5% hard-bounce
 circuit breaker + suppression, impersonation guardrails + audit, the tracking
 flow through the isolated tracker (3-label classifier), tracking-off-by-default,
-and trial-blocks-sending.
+and trial-blocks-sending — plus the pipeline admission tests: a suppressed
+recipient is skipped and reported (not fatal), a malformed address rejects the
+whole message, oversize messages are refused before anything is stored, a
+tracked message attributes its pixel to its sole recipient, and SMTP
+submission files exactly what the client sent (Message-ID and Date supplied
+when the client omits them).
+
+`SYNKRA_MAIL_HOSTNAME` is the one server identity (EHLO name, bounce
+Reporting-MTA, Message-ID domain, DNS-doctor MX target); it must resolve
+forward and reverse (FCrDNS) before real sending. Outbound TLS is opportunistic
+but never silently downgraded: certificate failures get exactly one
+unverified-TLS attempt (still encrypted), hosts without STARTTLS are logged
+and used in cleartext, and a failed TLS handshake never falls back to
+cleartext.
 
 Health probes: `GET /healthz` (process liveness) and `GET /readyz`
 (database ping + end-to-end blob-store probe) on the API listener.

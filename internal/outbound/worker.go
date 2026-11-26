@@ -15,7 +15,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/smtp"
 	"net/textproto"
 	"strings"
 	"time"
@@ -199,8 +198,10 @@ func (w *Worker) deferJob(ctx context.Context, j *model.DeliveryJob, attempts in
 	var delay time.Duration
 	if fixedDelay > 0 {
 		delay = fixedDelay
-	} else if attempts-1 < len(retryDelays) {
-		delay = retryDelays[attempts-1]
+	} else if attempts < len(retryDelays) {
+		// Attempt N gets the Nth delay of the table: attempt 1 → 1m,
+		// attempt 8 → 48h (Section 5.2). Index 0 is the immediate first send.
+		delay = retryDelays[attempts]
 	} else {
 		delay = retryDelays[len(retryDelays)-1]
 	}
@@ -271,7 +272,7 @@ func (w *Worker) injectDSN(ctx context.Context, j *model.DeliveryJob, kind strin
 	if w.Deps == nil {
 		return
 	}
-	raw := buildDSNMessage(j, kind, isHard, code, reason)
+	raw := buildDSNMessage(j, kind, isHard, code, reason, w.Pipeline.Cfg.Hostname)
 	dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	if err := ingest.DeliverLoopback(dctx, w.Deps, raw, "", j.EnvelopeFrom); err != nil {
@@ -279,8 +280,9 @@ func (w *Worker) injectDSN(ctx context.Context, j *model.DeliveryJob, kind strin
 	}
 }
 
-// buildDSNMessage renders an RFC 3464 multipart/report notice.
-func buildDSNMessage(j *model.DeliveryJob, kind string, isHard bool, code, reason string) []byte {
+// buildDSNMessage renders an RFC 3464 multipart/report notice. The Reporting-MTA
+// and the postmaster address come from the configured server identity.
+func buildDSNMessage(j *model.DeliveryJob, kind string, isHard bool, code, reason, hostname string) []byte {
 	var b strings.Builder
 	action := "delayed"
 	if kind == "bounce" {
@@ -290,7 +292,7 @@ func buildDSNMessage(j *model.DeliveryJob, kind string, isHard bool, code, reaso
 	if isHard {
 		status = "5.0.0"
 	}
-	fmt.Fprintf(&b, "From: Mail Delivery System <postmaster@synkra.email>\r\n")
+	fmt.Fprintf(&b, "From: Mail Delivery System <postmaster@%s>\r\n", hostname)
 	fmt.Fprintf(&b, "To: %s\r\n", j.EnvelopeFrom)
 	subject := "Mail delivery delayed: " + j.EnvelopeTo
 	if kind == "bounce" {
@@ -310,7 +312,7 @@ func buildDSNMessage(j *model.DeliveryJob, kind string, isHard bool, code, reaso
 	}
 	fmt.Fprintf(&b, "\r\n--dsn-%s\r\n", j.ID)
 	fmt.Fprintf(&b, "Content-Type: message/delivery-status\r\n\r\n")
-	fmt.Fprintf(&b, "Reporting-MTA: dns; mx1.synkra.email\r\n\r\n")
+	fmt.Fprintf(&b, "Reporting-MTA: dns; %s\r\n\r\n", hostname)
 	fmt.Fprintf(&b, "Original-Envelope-Id: %s\r\n", j.ID)
 	fmt.Fprintf(&b, "Action: %s\r\nStatus: %s\r\nDiagnostic-Code: smtp; %s %s\r\n", action, status, code, reason)
 	fmt.Fprintf(&b, "\r\n--dsn-%s--\r\n", j.ID)
@@ -359,62 +361,222 @@ func (t *LoopbackTransport) Deliver(ctx context.Context, envFrom, rcptTo string,
 	return 250, "delivered (loopback)", nil
 }
 
-// SMTPTransport: real outbound delivery (production). MX lookup + STARTTLS.
+// SMTPTransport: real outbound delivery (production). Hosts by MX preference
+// with the implicit-MX fallback; one connection per attempt — if the envelope
+// has been opened on a host, no second host may take it (RFC 5321 5.1). TLS is
+// opportunistic but never silently downgraded: a certificate that fails
+// verification gets exactly one unverified-TLS attempt (still encrypted); a
+// host that does not advertise STARTTLS is logged and used in cleartext.
 type SMTPTransport struct {
 	// HostPort override (staging/tests point at a local fake server); empty = MX lookup.
 	HostPort string
+	// HeloName is our EHLO identity; empty: "localhost" (callers pass the
+	// configured mail hostname).
+	HeloName string
 	Timeout  time.Duration
 }
 
 func (t *SMTPTransport) Deliver(ctx context.Context, envFrom, rcptTo string, raw []byte) (int, string, error) {
 	host := t.HostPort
 	if host == "" {
-		domain := rcptTo[strings.LastIndex(rcptTo, "@")+1:]
-		mxs, err := net.LookupMX(domain)
-		if err != nil || len(mxs) == 0 {
-			// No MX → A/AAAA fallback per RFC 5321.
-			mxs = []*net.MX{{Host: domain + ".", Pref: 0}}
+		h, err := pickMXHost(rcptTo)
+		if err != nil {
+			return 550, err.Error(), err // null MX: the domain accepts no mail
 		}
-		host = strings.TrimSuffix(mxs[0].Host, ".") + ":25"
+		host = h
 	}
+	helo := t.HeloName
+	if helo == "" {
+		helo = "localhost"
+	}
+
+	c, ext, err := t.connect(ctx, host, helo, true)
+	if err != nil && isCertError(err) {
+		// One unverified-TLS retry (encrypted but unauthenticated). After
+		// that: abort — never fall back to cleartext mid-flight (Section 7.5).
+		c, ext, err = t.connect(ctx, host, helo, false)
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	defer c.Close()
+	if !ext["STARTTLS"] && t.HostPort == "" {
+		log.Printf("[outbound] %s does not offer STARTTLS; sending in cleartext", hostOnly(host))
+	}
+
+	cmd := func(format string, args ...any) (int, string, error) {
+		id, cerr := c.Cmd(format, args...)
+		if cerr != nil {
+			return 0, "", cerr
+		}
+		c.StartResponse(id)
+		defer c.EndResponse(id)
+		code, msg, rerr := c.ReadResponse(-1)
+		if rerr != nil {
+			return 0, "", rerr
+		}
+		return code, msg, nil
+	}
+
+	code, msg, err := cmd("MAIL FROM:<%s>", envFrom)
+	if err != nil {
+		return 0, "", err
+	}
+	if code != 250 {
+		return code, msg, nil // protocol refusal: 5xx hard, 4xx transient
+	}
+	code, msg, err = cmd("RCPT TO:<%s>", rcptTo)
+	if err != nil {
+		return 0, "", err
+	}
+	if code != 250 {
+		return code, msg, nil
+	}
+
+	id, err := c.Cmd("DATA")
+	if err != nil {
+		return 0, "", err
+	}
+	c.StartResponse(id)
+	_, _, err = c.ReadResponse(354)
+	c.EndResponse(id)
+	if err != nil {
+		return 0, "", err
+	}
+	wr := c.DotWriter()
+	if _, werr := wr.Write(raw); werr != nil {
+		wr.Close()
+		return 0, "", werr
+	}
+	if werr := wr.Close(); werr != nil {
+		return 0, "", werr
+	}
+	fcode, fmsg, err := c.ReadResponse(250)
+	if err != nil {
+		return 0, "", err
+	}
+	_, _, _ = cmd("QUIT")
+	return fcode, fmsg, nil
+}
+
+// pickMXHost resolves where to deliver for rcptTo: MX records by preference
+// (RFC 5321 5.1), implicit MX when no record exists, and RFC 7505 null MX
+// (hard reject — the domain explicitly accepts no mail). Address literals
+// (user@[192.0.2.1], user@[IPv6:…]) dial the literal.
+func pickMXHost(rcptTo string) (string, error) {
+	domain := rcptTo[strings.LastIndex(rcptTo, "@")+1:]
+	if strings.HasPrefix(domain, "[") && strings.HasSuffix(domain, "]") {
+		lit := strings.TrimSuffix(strings.TrimPrefix(domain, "["), "]")
+		if strings.HasPrefix(strings.ToLower(lit), "ipv6:") {
+			lit = lit[len("ipv6:"):]
+		}
+		return lit, nil
+	}
+	mxs, err := net.LookupMX(domain)
+	if err != nil || len(mxs) == 0 {
+		// No MX record → the domain itself is the implicit MX (A/AAAA).
+		return domain, nil
+	}
+	if h := strings.TrimSuffix(mxs[0].Host, "."); h == "" || h == "." {
+		return "", errors.New("5.1.2 null MX: domain does not accept mail")
+	}
+	return strings.TrimSuffix(mxs[0].Host, "."), nil
+}
+
+// connect dials host:25 (a HostPort keeps its own port), greets, and upgrades
+// to TLS when advertised. verify controls certificate verification (Section 7.5).
+func (t *SMTPTransport) connect(ctx context.Context, host, helo string, verify bool) (*textproto.Conn, map[string]bool, error) {
 	d := t.Timeout
 	if d == 0 {
 		d = 60 * time.Second
 	}
-	conn, err := net.DialTimeout("tcp", host, d)
-	if err != nil {
-		return 0, "", err
+	addr := host
+	if _, _, perr := net.SplitHostPort(host); perr != nil {
+		addr = host + ":25"
 	}
-	c, err := smtp.NewClient(conn, hostOnly(host))
+	conn, err := net.DialTimeout("tcp", addr, d)
 	if err != nil {
-		conn.Close()
-		return 0, "", err
+		return nil, nil, err
 	}
-	defer c.Close()
-	_ = c.Hello("mx1.synkra.email")
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		if err := c.StartTLS(&tls.Config{ServerName: hostOnly(host), MinVersion: tls.VersionTLS12}); err != nil {
-			return 0, "", err
+	// One deadline for the whole dialogue; the per-command reads share it.
+	_ = conn.SetDeadline(time.Now().Add(d))
+	c := textproto.NewConn(conn)
+	if _, _, gerr := c.ReadResponse(220); gerr != nil {
+		c.Close()
+		return nil, nil, fmt.Errorf("greeting: %w", gerr)
+	}
+	ext, err := ehlo(c, helo)
+	if err != nil {
+		c.Close()
+		return nil, nil, err
+	}
+	if !ext["STARTTLS"] {
+		return c, ext, nil
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: hostOnly(host), MinVersion: tls.VersionTLS12,
+		InsecureSkipVerify: !verify,
+	})
+	hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(hctx); err != nil {
+		c.Close()
+		return nil, nil, err
+	}
+	nc := textproto.NewConn(tlsConn)
+	// The cipher suite changes the connection identity: greet again (RFC 3207 4).
+	ext, err = ehlo(nc, helo)
+	if err != nil {
+		nc.Close()
+		return nil, nil, err
+	}
+	return nc, ext, nil
+}
+
+// ehlo greets (falling back to HELO for ancient servers) and returns the
+// advertised extension keywords.
+func ehlo(c *textproto.Conn, helo string) (map[string]bool, error) {
+	id, err := c.Cmd("EHLO %s", helo)
+	if err != nil {
+		return nil, err
+	}
+	c.StartResponse(id)
+	_, msg, err := c.ReadResponse(250)
+	c.EndResponse(id)
+	if err != nil {
+		id2, herr := c.Cmd("HELO %s", helo)
+		if herr != nil {
+			return nil, herr
+		}
+		c.StartResponse(id2)
+		defer c.EndResponse(id2)
+		if _, _, err := c.ReadResponse(250); err != nil {
+			return nil, fmt.Errorf("helo: %w", err)
+		}
+		return map[string]bool{}, nil
+	}
+	ext := map[string]bool{}
+	// msg is the multiline response joined with \n: line 0 is the server
+	// banner, the rest are the advertised extensions.
+	for _, line := range strings.Split(msg, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 0 {
+			ext[strings.ToUpper(f[0])] = true
 		}
 	}
-	if err := c.Mail(envFrom); err != nil {
-		return smtpCodeOf(err), err.Error(), err
+	return ext, nil
+}
+
+// isCertError reports whether err is a TLS certificate-verification failure
+// (as opposed to a protocol or network error).
+func isCertError(err error) bool {
+	if err == nil {
+		return false
 	}
-	if err := c.Rcpt(rcptTo); err != nil {
-		return smtpCodeOf(err), err.Error(), err
-	}
-	wr, err := c.Data()
-	if err != nil {
-		return smtpCodeOf(err), err.Error(), err
-	}
-	if _, err := wr.Write(raw); err != nil {
-		return 0, "", err
-	}
-	if err := wr.Close(); err != nil {
-		return smtpCodeOf(err), err.Error(), err
-	}
-	_ = c.Quit()
-	return 250, "accepted", nil
+	var ua x509.UnknownAuthorityError
+	var hn x509.HostnameError
+	var ci x509.CertificateInvalidError
+	return errors.As(err, &ua) || errors.As(err, &hn) || errors.As(err, &ci)
 }
 
 func hostOnly(hostport string) string {
@@ -422,12 +584,4 @@ func hostOnly(hostport string) string {
 		return h
 	}
 	return hostport
-}
-
-func smtpCodeOf(err error) int {
-	var serr *textproto.Error
-	if errors.As(err, &serr) {
-		return serr.Code
-	}
-	return 451
 }

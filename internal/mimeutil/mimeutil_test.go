@@ -2,6 +2,7 @@ package mimeutil
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -143,5 +144,124 @@ func TestSnippet(t *testing.T) {
 	}
 	if Snippet("a\n\n b\t c") != "a b c" {
 		t.Fatalf("snippet collapse: %q", Snippet("a\n\n b\t c"))
+	}
+}
+
+func TestBuildHeaderOrderAndMessageID(t *testing.T) {
+	in := ComposeInput{
+		From:            Addr{Email: "from@customer.example", Name: `Doe, Jane "JD"`},
+		To:              []Addr{{Email: "to@a.b", Name: "Ünïcode Recipient"}},
+		Subject:         "order",
+		Text:            "x",
+		MessageIDDomain: "mx1.example",
+	}
+	raw, msgID, err := Build(in)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !strings.HasPrefix(msgID, "<") || !strings.HasSuffix(msgID, "@mx1.example>") {
+		t.Fatalf("message id domain: %q", msgID)
+	}
+	head := string(raw[:bytes.Index(raw, []byte("\r\n\r\n"))])
+	var names []string
+	for _, line := range strings.Split(head, "\r\n") {
+		if i := strings.IndexByte(line, ':'); i > 0 {
+			names = append(names, line[:i])
+		}
+	}
+	want := []string{"From", "To", "Subject", "Date", "Message-Id", "Mime-Version",
+		"Content-Type", "Content-Transfer-Encoding", "X-Mailer"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("header order = %v, want %v", names, want)
+	}
+	if !strings.Contains(head, `From: "Doe, Jane \"JD\"" <from@customer.example>`) {
+		t.Fatalf("quoted display name missing: %q", head)
+	}
+	if !strings.Contains(head, "To: =?utf-8?q?") {
+		t.Fatalf("encoded display name missing: %q", head)
+	}
+}
+
+func TestBuildBccOnlyOmitsToHeader(t *testing.T) {
+	raw, _, err := Build(ComposeInput{
+		From:    Addr{Email: "f@x.y"},
+		Bcc:     []Addr{{Email: "hidden@a.b"}},
+		Subject: "bcc only",
+		Text:    "x",
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if strings.Contains(string(raw), "To:") {
+		t.Fatalf("Bcc-only message must carry no To header:\n%s", raw)
+	}
+}
+
+func TestValidAddress(t *testing.T) {
+	valid := []string{
+		"a@example.com",
+		"first.last+tag@sub.example.co.za",
+		"o'brien@example.com",
+		"USER_1@EXAMPLE.IO",
+		"user@[192.0.2.1]",
+		"user@[IPv6:2001:db8::1]",
+		strings.Repeat("a", 64) + "@example.com",
+	}
+	for _, s := range valid {
+		if !ValidAddress(s) {
+			t.Fatalf("ValidAddress(%q) = false, want true", s)
+		}
+	}
+	invalid := []string{
+		"",
+		"@example.com",
+		"a@",
+		"a@localhost",
+		"a b@example.com",
+		"a@b c.com",
+		"Name <a@example.com>",
+		"a@example.com\r\nBcc: x@y.z",
+		strings.Repeat("a", 65) + "@example.com",
+		"a@-example.com",
+		"a@example-.com",
+		"a@[192.0.2.1",
+		"a@[not-a-literal]",
+		".dot@example.com",
+		"dot.@example.com",
+		"do..t@example.com",
+		"a@example.com,",
+		"user@example.com ",
+	}
+	for _, s := range invalid {
+		if ValidAddress(s) {
+			t.Fatalf("ValidAddress(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestAddMissingHeaders(t *testing.T) {
+	raw := []byte("From: a@b.c\r\n\r\nbody\r\n")
+	out := AddMissingHeaders(raw,
+		Header{"Message-ID", "<x@y.z>"},
+		Header{"Date", "Mon, 02 Jan 2006 15:04:05 -0700"},
+		Header{"X-Empty", ""})
+	s := string(out)
+	if !strings.HasPrefix(s, "Message-ID: <x@y.z>\r\nDate: Mon, 02 Jan 2006 15:04:05 -0700\r\nFrom: a@b.c\r\n") {
+		t.Fatalf("prefix wrong: %q", s)
+	}
+	if strings.Contains(s, "X-Empty") {
+		t.Fatal("empty value must be skipped")
+	}
+	if HasHeader(raw, "Message-ID") {
+		t.Fatal("HasHeader must report on the original message")
+	}
+	if !HasHeader(out, "Message-ID") || !HasHeader(out, "Date") {
+		t.Fatal("HasHeader must find the added headers")
+	}
+	if !HasHeader([]byte("from: a@b.c\r\n\r\nx"), "From") {
+		t.Fatal("HasHeader is case-insensitive")
+	}
+	if HasHeader([]byte("X-Joe: 1\r\n\r\nx"), "Joe") {
+		t.Fatal("HasHeader must match whole names, not prefixes")
 	}
 }

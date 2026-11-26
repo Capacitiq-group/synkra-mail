@@ -11,6 +11,7 @@ import (
 	"mime/quotedprintable"
 	"net/textproto"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -159,6 +160,10 @@ type ComposeInput struct {
 	References  []string
 	Attachments []Att
 	Date        time.Time
+
+	// MessageIDDomain is the domain of the minted Message-ID. Empty: derived
+	// from the From address's domain; no domain there either: "localhost".
+	MessageIDDomain string
 }
 
 // Build renders an RFC 822 message (quoted-printable text, multipart when
@@ -167,10 +172,14 @@ func Build(in ComposeInput) (raw []byte, messageID string, err error) {
 	if in.Date.IsZero() {
 		in.Date = time.Now()
 	}
-	messageID = fmt.Sprintf("<%s.mail.synkra.co.za>", uuid.New())
+	messageID = NewMessageID(messageIDDomain(in))
 	h := textproto.MIMEHeader{}
 	h.Set("From", formatAddr(in.From))
-	h.Set("To", formatAddrList(in.To))
+	// A message with no visible recipients (Bcc only, Section 3.6.3) carries
+	// no To header — an empty one would be invalid.
+	if len(in.To) > 0 {
+		h.Set("To", formatAddrList(in.To))
+	}
 	if len(in.Cc) > 0 {
 		h.Set("Cc", formatAddrList(in.Cc))
 	}
@@ -291,9 +300,39 @@ func Build(in ComposeInput) (raw []byte, messageID string, err error) {
 	return buf.Bytes(), messageID, nil
 }
 
+// headerOrder fixes the wire order of our own headers: deterministic output
+// for tests, DKIM and spam filters. Keys are canonical MIME header names;
+// anything not listed is appended after them, alphabetically.
+var headerOrder = []string{
+	"From", "To", "Cc", "Subject", "Date", "Message-Id", "In-Reply-To",
+	"References", "Mime-Version", "Content-Type", "Content-Transfer-Encoding",
+	"Content-Disposition", "Content-Id", "X-Mailer",
+}
+
+func headerRank(k string) int {
+	k = textproto.CanonicalMIMEHeaderKey(k)
+	for i, name := range headerOrder {
+		if name == k {
+			return i
+		}
+	}
+	return len(headerOrder)
+}
+
 func writeHeader(buf *bytes.Buffer, h textproto.MIMEHeader) error {
-	for k, vs := range h {
-		for _, v := range vs {
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		ri, rj := headerRank(keys[i]), headerRank(keys[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return keys[i] < keys[j]
+	})
+	for _, k := range keys {
+		for _, v := range h[k] {
 			if _, err := fmt.Fprintf(buf, "%s: %s\r\n", k, v); err != nil {
 				return err
 			}
@@ -318,11 +357,33 @@ func base64Lines(b []byte) []byte {
 	return out.Bytes()
 }
 
+// addrSpecials: characters that change header parsing (RFC 5322 3.2.3);
+// a display name containing one must be quoted.
+const addrSpecials = `()<>[]:;@\,.">`
+
 func formatAddr(a Addr) string {
 	if a.Name == "" {
 		return a.Email
 	}
-	return fmt.Sprintf("%s <%s>", mime.QEncoding.Encode("utf-8", a.Name), a.Email)
+	// Header values are single lines: folded whitespace becomes spaces.
+	name := strings.Join(strings.Fields(a.Name), " ")
+	if name == "" {
+		return a.Email
+	}
+	ascii := true
+	for _, r := range name {
+		if r < 0x20 || r > 0x7e {
+			ascii = false
+			break
+		}
+	}
+	if !ascii {
+		return fmt.Sprintf("%s <%s>", mime.QEncoding.Encode("utf-8", name), a.Email)
+	}
+	if strings.ContainsAny(name, addrSpecials) {
+		return fmt.Sprintf("%q <%s>", name, a.Email)
+	}
+	return fmt.Sprintf("%s <%s>", name, a.Email)
 }
 
 func formatAddrList(l []Addr) string {
@@ -348,4 +409,137 @@ func ensureAngle(s string) string {
 		s = s + ">"
 	}
 	return s
+}
+
+// NewMessageID mints an RFC 5322 msg-id for the given domain.
+func NewMessageID(domain string) string {
+	return fmt.Sprintf("<%s@%s>", uuid.NewString(), domain)
+}
+
+// messageIDDomain resolves the Message-ID domain: the explicit override, else
+// the From address's domain, else localhost (nothing leaves without one).
+func messageIDDomain(in ComposeInput) string {
+	if in.MessageIDDomain != "" {
+		return in.MessageIDDomain
+	}
+	if i := strings.LastIndex(in.From.Email, "@"); i > 0 && i < len(in.From.Email)-1 {
+		return in.From.Email[i+1:]
+	}
+	return "localhost"
+}
+
+// ---- header patching (the submission path keeps the client's message) ----
+
+// HasHeader reports whether raw already carries a header with that name
+// (case-insensitive; folded continuation lines are skipped).
+func HasHeader(raw []byte, name string) bool {
+	nameL := strings.ToLower(name)
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if len(line) == 0 {
+			break // header block ended
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			continue // continuation
+		}
+		if i := bytes.IndexByte(line, ':'); i > 0 && strings.EqualFold(string(line[:i]), nameL) {
+			return true
+		}
+	}
+	return false
+}
+
+// Header is one name/value pair for AddMissingHeaders.
+type Header struct {
+	Name  string
+	Value string
+}
+
+// AddMissingHeaders prepends headers the client omitted. Nothing the client
+// wrote is rewritten, and values are stripped of CR/LF (header injection).
+func AddMissingHeaders(raw []byte, headers ...Header) []byte {
+	if len(headers) == 0 {
+		return raw
+	}
+	var b bytes.Buffer
+	for _, h := range headers {
+		v := strings.Join(strings.Fields(strings.ReplaceAll(h.Value, "\r", " ")), " ")
+		if v == "" {
+			continue
+		}
+		b.WriteString(h.Name)
+		b.WriteString(": ")
+		b.WriteString(v)
+		b.WriteString("\r\n")
+	}
+	b.Write(raw)
+	return b.Bytes()
+}
+
+// ---- address validation (RFC 5322 3.4.1 dot-atom, RFC 5321 4.1.2/4.1.3) ----
+
+var literalRe = regexp.MustCompile(`^(?:\[[0-9]{1,3}(?:\.[0-9]{1,3}){3}\]|\[IPv6:[0-9A-Fa-f:.]{2,39}\])$`)
+
+// isAtext reports whether r may appear in an atom (RFC 5322 3.2.3 atext).
+func isAtext(r rune) bool {
+	if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+		return true
+	}
+	return strings.ContainsRune("!#$%&'*+-/=?^_`{|}~", r)
+}
+
+// ValidAddress accepts exactly what we will put on the wire: a dot-atom local
+// part, a dotted domain or an address literal, 254 octets overall, local part
+// at most 64. Display names, folding whitespace and control characters are
+// rejected outright.
+func ValidAddress(s string) bool {
+	if len(s) > 254 {
+		return false
+	}
+	i := strings.LastIndexByte(s, '@')
+	if i <= 0 || i > 64 || i == len(s)-1 {
+		return false
+	}
+	// A dotted local part (first.last+tag) is fine; a dot may not lead,
+	// trail or double up.
+	local := s[:i]
+	for n := 0; n < len(local); n++ {
+		c := local[n]
+		if c == '.' {
+			if n == 0 || n == len(local)-1 || local[n-1] == '.' {
+				return false
+			}
+			continue
+		}
+		if !isAtext(rune(c)) {
+			return false
+		}
+	}
+	domain := s[i+1:]
+	if strings.HasPrefix(domain, "[") {
+		return literalRe.MatchString(domain)
+	}
+	labels := strings.Split(domain, ".")
+	top := len(labels) - 1
+	for n, label := range labels {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '-' {
+				continue
+			}
+			if r >= '0' && r <= '9' {
+				if n == top {
+					return false // all-numeric TLD
+				}
+				continue
+			}
+			return false
+		}
+	}
+	return top >= 1 && len(labels[top]) >= 2
 }

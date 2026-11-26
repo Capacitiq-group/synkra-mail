@@ -205,6 +205,12 @@ func mapError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "mailbox_paused", err.Error())
 	case errors.Is(err, outbound.ErrMailboxFull):
 		writeError(w, http.StatusForbidden, "mailbox_full", err.Error())
+	case errors.Is(err, outbound.ErrMessageTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "message_too_large", err.Error())
+	case errors.Is(err, outbound.ErrInvalidAddress):
+		writeError(w, http.StatusBadRequest, "invalid_address", err.Error())
+	case errors.Is(err, outbound.ErrNoRecipients):
+		writeError(w, http.StatusBadRequest, "no_recipients", err.Error())
 	case errors.Is(err, outbound.ErrLimitExceeded):
 		writeError(w, http.StatusTooManyRequests, "limit_exceeded", err.Error())
 	case errors.Is(err, authn.ErrLocked):

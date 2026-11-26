@@ -39,12 +39,14 @@ func scanDeliveryJob(row pgx.Row) (*model.DeliveryJob, error) {
 	return &j, nil
 }
 
-// ClaimDueJobs leases up to limit jobs atomically (FOR UPDATE SKIP LOCKED, Section 5.3).
+// ClaimDueJobs leases up to limit jobs atomically (FOR UPDATE SKIP LOCKED,
+// Section 5.3). Jobs still in_flight whose lease expired are reclaimed: the
+// leasing worker died mid-delivery, so the job is retried on this worker.
 func ClaimDueJobs(ctx context.Context, q Querier, workerID string, lease time.Duration, limit int) ([]model.DeliveryJob, error) {
 	rows, err := q.Query(ctx, `
 		with due as (
 			select id from mail.delivery_job
-			where status in ('queued','deferred')
+			where status in ('queued','deferred','in_flight')
 			  and next_attempt_at <= now()
 			  and (lease_until is null or lease_until < now())
 			order by next_attempt_at
@@ -192,12 +194,16 @@ func BounceStats(ctx context.Context, q Querier, mailboxID uuid.UUID, window tim
 	return attempts, hardBounces, rate, rate > 0, nil
 }
 
-// BounceRatePct returns the raw hard-bounce rate for a mailbox over the window.
+// BounceRatePct returns the hard-bounce rate for a mailbox over the window,
+// keyed on recorded DSNs: attempts are completed attempts only (a queued,
+// deferred or in-flight job is not an attempt), and "hard" is the is_hard
+// flag the DSN carried — not a guess from the last message text.
 func BounceRatePct(ctx context.Context, q Querier, mailboxID uuid.UUID, window time.Duration) (attempts, hard int, pct float64, err error) {
 	err = q.QueryRow(ctx, `
-		select count(*), count(*) filter (where status='bounced' and coalesce(last_msg,'') like '5%')
-		from mail.delivery_job
-		where mailbox_id=$1 and is_dsn=false and updated_at > now() - make_interval(secs => $2)`,
+		select count(*), count(*) filter (where d.is_hard)
+		from mail.dsn d
+		join mail.delivery_job j on j.id = d.delivery_job_id
+		where j.mailbox_id=$1 and j.is_dsn=false and d.created_at > now() - make_interval(secs => $2)`,
 		mailboxID, int(window.Seconds())).Scan(&attempts, &hard)
 	if err != nil {
 		return 0, 0, 0, err

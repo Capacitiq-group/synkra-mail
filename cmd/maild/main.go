@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -181,11 +182,22 @@ func main() {
 	if roles["worker"] {
 		var transport outbound.Transport = &outbound.LoopbackTransport{Deps: deps}
 		if cfg.Env == "prod" {
-			transport = &outbound.SMTPTransport{}
+			transport = &outbound.SMTPTransport{HeloName: cfg.Hostname}
 		}
-		w := outbound.NewWorker(pipeline, transport)
-		go w.Run(ctx)
-		log.Printf("[worker] outbound worker started (transport=%s)",
+		workers := cfg.WorkerCount
+		if workers < 1 {
+			workers = 1
+		}
+		workerWG := &sync.WaitGroup{}
+		for i := 0; i < workers; i++ {
+			workerWG.Add(1)
+			go func() {
+				defer workerWG.Done()
+				outbound.NewWorker(pipeline, transport).Run(ctx)
+			}()
+		}
+		defer gracefulQueueDrain(workerWG)
+		log.Printf("[worker] %d outbound workers started (transport=%s)", workers,
 			map[bool]string{true: "smtp", false: "loopback"}[cfg.Env == "prod"])
 	}
 
@@ -207,6 +219,23 @@ func main() {
 		if err != nil {
 			log.Fatalf("server error: %v", err)
 		}
+	}
+}
+
+// gracefulQueueDrain waits up to 30 s for in-flight deliveries to finish so a
+// restart does not strand claimed jobs (they would only be reclaimed after the
+// 10-minute lease expires).
+func gracefulQueueDrain(wg *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("[worker] queue drained, exiting")
+	case <-time.After(30 * time.Second):
+		log.Printf("[worker] 30s shutdown grace elapsed with jobs still in flight")
 	}
 }
 
