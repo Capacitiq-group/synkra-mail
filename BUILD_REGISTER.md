@@ -7,7 +7,7 @@
 | Phase | Register sections | Status | Commit | Date |
 |---|---|---|---|---|
 | 0 | Register adopted into the repository, status tracking added | **done** | this commit | 2026-11-26 |
-| 1 | §1 API and authentication hardening (1.1–1.10) | planned | — | — |
+| 1 | §1 API and authentication hardening (1.1–1.10) | **done** (1.1–1.10 code + E2E tests) | this commit | 2026-11-26 |
 | 2 | §2 Missing endpoints (2.1–2.13) | planned | — | — |
 | 3 | §3 Operations, packaging and verification (3.1–3.10) | planned | — | — |
 | 4 | §5 IMAP completeness (5.1–5.3) | planned | — | — |

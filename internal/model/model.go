@@ -321,3 +321,16 @@ const (
 	FlagDraft    = "\\Draft"
 	FlagRecent   = "\\Recent"
 )
+
+// Idempotency is a stored first response for a keyed request (build register
+// §1.9): keyed retries replay it instead of executing twice.
+type Idempotency struct {
+	ID          uuid.UUID
+	UserID      uuid.UUID
+	Key         string
+	Endpoint    string
+	RequestHash string
+	Status      int
+	Response    []byte // raw JSON, stored as jsonb
+	CreatedAt   time.Time
+}

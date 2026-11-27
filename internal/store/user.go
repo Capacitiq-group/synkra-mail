@@ -40,6 +40,28 @@ func GetUserByEmail(ctx context.Context, q Querier, email string) (*model.User, 
 	return scanUser(row)
 }
 
+// ListUsersByEmail returns every user with this login e-mail. The schema keeps
+// e-mail uniqueness per organisation (unique (org_id, email)), so two orgs can
+// legitimately share a login address; login resolves that explicitly (authn).
+func ListUsersByEmail(ctx context.Context, q Querier, email string) ([]model.User, error) {
+	rows, err := q.Query(ctx, `select id, org_id, email, coalesce(password_hash,''),
+		(totp_secret_enc is not null), display_name, role, is_platform_admin, status, created_at, updated_at
+		from mail.user where email=$1 order by created_at`, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *u)
+	}
+	return out, rows.Err()
+}
+
 func ListUsersByOrg(ctx context.Context, q Querier, orgID uuid.UUID) ([]model.User, error) {
 	rows, err := q.Query(ctx, `select id, org_id, email, coalesce(password_hash,''),
 		(totp_secret_enc is not null), display_name, role, is_platform_admin, status, created_at, updated_at
@@ -209,7 +231,8 @@ func RecordLoginAttempt(ctx context.Context, q Querier, email, ip string, ok boo
 func CountRecentFailedLogins(ctx context.Context, q Querier, email, ip string, window string) (int, error) {
 	var n int
 	err := q.QueryRow(ctx, `select count(*) from mail.login_attempt
-		where ok=false and created_at > now() - $1::interval and (email=$2 or ip=$3)`, window, optText(email), optText(ip)).Scan(&n)
+		where ok=false and created_at > now() - $1::interval
+		  and (($2 <> '' and email=$2) or ($3 <> '' and ip=$3))`, window, optText(email), optText(ip)).Scan(&n)
 	if err != nil && errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}

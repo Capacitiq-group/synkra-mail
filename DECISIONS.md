@@ -40,6 +40,12 @@ manageable first release.
 | E | Suppression list | A suppressed recipient is skipped and reported per recipient instead of aborting the whole message; all-suppressed refuses. One malformed address still rejects the whole message. |
 | F | Bounce-pause volume | The breaker's denominator is completed attempts recorded as DSNs, with hard bounces keyed on the DSN `is_hard` flag — queued/deferred jobs no longer inflate the denominator. |
 | G | Bounce-pause accounting | A hard bounce is recorded and counted under a row lock on the mailbox, so concurrent workers count attempts one after another. Without the lock two workers could each miss the other's uncommitted DSN and both skip the pause. |
+| H | Login identity (§1.2) | The schema keeps login e-mail unique per organisation; login resolves duplicates by domain ownership and refuses a truly ambiguous login with a 409 instead of silently picking one. |
+| I | Suspended-org access (§1.3) | A suspended org keeps exactly logout and the /me status read; the old \"/admin/\" prefix test could never match paths under /api/v1, so it was dead code. |
+| J | Reserved platform addresses (§1.5) | postmaster, abuse, admin, hostmaster, webmaster and security cannot be registered on the platform domain by any organisation (RFC 2142); they stay platform-operated. Custom domains are unaffected. |
+| K | Idempotency keys (§1.9) | POST /send, address (alias) creation and domain create/verify accept an Idempotency-Key header; the first response is stored per user + key and replayed; a key reused with a different body is a 422. |
+| L | App-password lockout (§1.6) | IMAP and submission logins share the web login's 10-fails/10-minute lockout. Submission keys it by login identity + source IP; IMAP keys it by login identity (go-imap v2 beta.8 exposes no remote address to sessions). |
+| M | Message-list pagination (§1.8) | GET /messages pages by uid cursor (limit, default 50 / max 200; before_uid), newest page first, ascending order inside a page — the folder is never loaded whole. |
 
 ### Explicitly still pending
 

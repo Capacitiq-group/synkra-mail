@@ -3,10 +3,12 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -243,19 +245,42 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "no access")
 		return
 	}
+	// Cursor pagination (register §1.8): `limit` (default 50, max 200) newest
+	// items; the next page is fetched with before_uid = the smallest uid of
+	// this page. The folder is never loaded whole just to keep the last 50.
 	limit := 50
-	items, err := store.ListItems(r.Context(), s.Store.Pool, folderID, 0, 0xffffffff)
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 1 || n > 200 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "limit must be 1..200")
+			return
+		}
+		limit = n
+	}
+	var beforeUID uint32
+	if v := r.URL.Query().Get("before_uid"); v != "" {
+		n, perr := strconv.ParseUint(v, 10, 32)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "before_uid must be a uid")
+			return
+		}
+		beforeUID = uint32(n)
+	}
+	items, err := store.ListItemsPage(r.Context(), s.Store.Pool, folderID, beforeUID, limit)
 	if err != nil {
 		mapError(w, err)
 		return
 	}
-	if len(items) > limit {
-		items = items[len(items)-limit:]
+	out := map[string]any{
+		"folder":   folderViews([]model.Folder{*folder})[0],
+		"items":    itemViewList(items),
+		"limit":    limit,
+		"has_more": len(items) == limit,
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"folder": folderViews([]model.Folder{*folder})[0],
-		"items":  itemViewList(items),
-	})
+	if len(items) > 0 {
+		out["next_before_uid"] = items[0].Item.UID // smallest uid of the page
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
@@ -458,6 +483,16 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	// Cap the request one message above the plan's message cap: the JSON
 	// envelope and its attachments must fit both here and on the wire.
 	r.Body = http.MaxBytesReader(w, r.Body, s.Cfg.MaxMessageBytes+(1<<20))
+	body, err := readBody(r)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, "message_too_large", "request body exceeds the message size limit")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
+		return
+	}
 	var req struct {
 		From        string          `json:"from"`
 		To          []mimeutil.Addr `json:"to"`
@@ -470,13 +505,18 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		Track       bool            `json:"track"`
 		Attachments []mimeutil.Att  `json:"attachments"`
 	}
-	if err := decodeJSON(r, &req); err != nil {
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
-			writeError(w, http.StatusRequestEntityTooLarge, "message_too_large", "request body exceeds the message size limit")
-			return
-		}
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
+		return
+	}
+	// Idempotency-Key (register §1.9): a retried send replays the first
+	// response instead of queueing the message twice.
+	key := r.Header.Get("Idempotency-Key")
+	if status, resp, replay, ierr := s.idempotentBegin(r.Context(), ac, key, "send", body); ierr != nil {
+		mapError(w, ierr)
+		return
+	} else if replay {
+		s.replayJSON(w, status, resp)
 		return
 	}
 	if req.From == "" {
@@ -499,10 +539,15 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		mapError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
+	resp := map[string]any{
 		"message_id": ids.Format(ids.Message, msgID),
 		"recipients": recipients,
-	})
+	}
+	if ferr := s.idempotentFinish(r.Context(), ac, key, "send", body, http.StatusAccepted, resp); ferr != nil {
+		mapError(w, ferr)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (s *Server) primaryAddress(ctx interface {
@@ -613,6 +658,22 @@ func (s *Server) handleMessageTracking(w http.ResponseWriter, r *http.Request) {
 
 // ---- threads (shared inbox: internal note + assignment — Section 10.3) ----
 
+// threadActorCanAccess checks membership of the mailboxes the thread's messages
+// live in (register §1.4): org membership alone is a privilege leak across
+// mailboxes within one org.
+func (s *Server) threadActorCanAccess(ctx context.Context, ac *authn.AuthContext, threadID uuid.UUID) (bool, error) {
+	mbs, err := store.ThreadMailboxIDs(ctx, s.Store.Pool, threadID)
+	if err != nil {
+		return false, err
+	}
+	for _, mbID := range mbs {
+		if acc, aerr := store.MailboxAccess(ctx, s.Store.Pool, ac.User.ID, mbID); aerr == nil && acc {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Server) handleThreadNote(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Thread)
@@ -627,8 +688,17 @@ func (s *Server) handleThreadNote(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
 		return
 	}
+	acc, err := s.threadActorCanAccess(r.Context(), ac, id)
+	if err != nil {
+		mapError(w, err)
+		return
+	}
+	if !acc {
+		writeError(w, http.StatusForbidden, "forbidden", "no access to this thread's mailbox")
+		return
+	}
 	// Internal notes are never transmitted — they live on the thread row only.
-	err := s.Store.WithTx(r.Context(), func(tx store.Tx) error {
+	err = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
 		_, err := tx.Exec(r.Context(), `update mail.thread set note=$2, updated_at=now() where id=$1 and org_id=$3`,
 			id, req.Note, ac.User.OrgID)
 		return err
@@ -659,7 +729,35 @@ func (s *Server) handleThreadAssign(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "bad assignee_id")
 		return
 	}
-	err := s.Store.WithTx(r.Context(), func(tx store.Tx) error {
+	acc, err := s.threadActorCanAccess(r.Context(), ac, id)
+	if err != nil {
+		mapError(w, err)
+		return
+	}
+	if !acc {
+		writeError(w, http.StatusForbidden, "forbidden", "no access to this thread's mailbox")
+		return
+	}
+	// The assignee must be able to see the thread too (register §1.4).
+	if req.AssigneeID != "" {
+		mbs, merr := store.ThreadMailboxIDs(r.Context(), s.Store.Pool, id)
+		if merr != nil {
+			mapError(w, merr)
+			return
+		}
+		ok := false
+		for _, mbID := range mbs {
+			if aacc, aerr := store.MailboxAccess(r.Context(), s.Store.Pool, assignee, mbID); aerr == nil && aacc {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			writeError(w, http.StatusForbidden, "forbidden", "assignee is not a member of this thread's mailbox")
+			return
+		}
+	}
+	err = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
 		_, err := tx.Exec(r.Context(), `update mail.thread set assignee_id=$2, updated_at=now() where id=$1 and org_id=$3`,
 			id, optUUIDPtr(assignee, ok && req.AssigneeID != ""), ac.User.OrgID)
 		return err
@@ -706,6 +804,11 @@ func (s *Server) handleCreateAddress(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "org admin only")
 		return
 	}
+	body, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
+		return
+	}
 	var req struct {
 		Local         string `json:"local"`
 		DomainID      string `json:"domain_id"`
@@ -713,8 +816,18 @@ func (s *Server) handleCreateAddress(w http.ResponseWriter, r *http.Request) {
 		Kind          string `json:"kind"` // alias | forward | user
 		ForwardTarget string `json:"forward_target"`
 	}
-	if err := decodeJSON(r, &req); err != nil || req.Local == "" {
+	if err := json.Unmarshal(body, &req); err != nil || req.Local == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "local required")
+		return
+	}
+	// Idempotency-Key (register §1.9): alias creation replays instead of
+	// double-creating on a retried submit.
+	key := r.Header.Get("Idempotency-Key")
+	if status, resp, replay, ierr := s.idempotentBegin(r.Context(), ac, key, "addresses", body); ierr != nil {
+		mapError(w, ierr)
+		return
+	} else if replay {
+		s.replayJSON(w, status, resp)
 		return
 	}
 	if req.Kind == "" {
@@ -767,7 +880,12 @@ func (s *Server) handleCreateAddress(w http.ResponseWriter, r *http.Request) {
 		mapError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": ids.Format(ids.Address, a.ID)})
+	resp := map[string]any{"id": ids.Format(ids.Address, a.ID)}
+	if ferr := s.idempotentFinish(r.Context(), ac, key, "addresses", body, http.StatusCreated, resp); ferr != nil {
+		mapError(w, ferr)
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) handleDeleteAddress(w http.ResponseWriter, r *http.Request) {
@@ -803,15 +921,28 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
+	body, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
+		return
+	}
 	var req struct {
 		Name string `json:"name"`
 	}
-	if err := decodeJSON(r, &req); err != nil || !strings.Contains(req.Name, ".") {
+	if err := json.Unmarshal(body, &req); err != nil || !strings.Contains(req.Name, ".") {
 		writeError(w, http.StatusBadRequest, "invalid_request", "valid domain name required")
 		return
 	}
+	key := r.Header.Get("Idempotency-Key")
+	if status, resp, replay, ierr := s.idempotentBegin(r.Context(), ac, key, "domains", body); ierr != nil {
+		mapError(w, ierr)
+		return
+	} else if replay {
+		s.replayJSON(w, status, resp)
+		return
+	}
 	d := &model.Domain{ID: uuid.New(), OrgID: &ac.User.OrgID, Name: strings.ToLower(strings.TrimSpace(req.Name)), Status: "pending"}
-	err := s.Store.WithTx(r.Context(), func(tx store.Tx) error {
+	err = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
 		return store.CreateDomain(r.Context(), tx, d)
 	})
 	if err != nil {
@@ -822,12 +953,17 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		mapError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	resp := map[string]any{
 		"domain":          domainViews([]model.Domain{*d})[0],
 		"ownership_token": d.OwnershipToken,
 		"dkim_selector":   d.DKIMSelector,
 		"dkim_public_txt": d.DKIMPublicTXT,
-	})
+	}
+	if ferr := s.idempotentFinish(r.Context(), ac, key, "domains", body, http.StatusCreated, resp); ferr != nil {
+		mapError(w, ferr)
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) handleVerifyDomain(w http.ResponseWriter, r *http.Request) {
@@ -852,7 +988,21 @@ func (s *Server) handleVerifyDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if lerr != nil || !verified {
-		writeJSON(w, http.StatusOK, map[string]any{"verified": false, "hint": "publish TXT " + dom.OwnershipToken + " on " + dom.Name + " then retry"})
+		// DNS doctor honesty (register §1.10): say what is wrong, why, and how
+		// to fix it — not just a code.
+		what := "ownership TXT record not found on " + dom.Name
+		if lerr != nil {
+			what = "TXT lookup for " + dom.Name + " failed: " + lerr.Error()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"verified": false,
+			"problem": map[string]string{
+				"what": what,
+				"why":  "domain ownership cannot be proven without the token record, so the platform cannot sign or receive for this domain",
+				"fix":  "publish TXT @ " + dom.OwnershipToken + " on " + dom.Name + " (TTL 300-600s), wait for propagation, then retry",
+			},
+			"hint": "publish TXT " + dom.OwnershipToken + " on " + dom.Name + " then retry",
+		})
 		return
 	}
 	err = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
@@ -1036,12 +1186,10 @@ func (s *Server) resolveMailboxParam(r *http.Request, ac *authn.AuthContext) (*m
 	return mb, err == nil, err
 }
 
+// parseIDParam enforces the route's expected id type (register §1.1): a msg_ id
+// passed where a folder id is required is a bad request, not a lookup miss.
 func parseIDParam(s, prefix string) (uuid.UUID, bool) {
-	if i := strings.IndexByte(s, '_'); i > 0 {
-		s = s[i+1:]
-	}
-	u, err := uuid.Parse(s)
-	return u, err == nil
+	return ids.ParseTyped(s, prefix)
 }
 
 func optUUIDPtr(u uuid.UUID, use bool) any {

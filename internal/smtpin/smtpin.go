@@ -18,6 +18,7 @@ import (
 	"github.com/emersion/go-sasl"
 	gosmtp "github.com/emersion/go-smtp"
 
+	"synkra.email/mail/internal/authn"
 	"synkra.email/mail/internal/config"
 	"synkra.email/mail/internal/ingest"
 	"synkra.email/mail/internal/store"
@@ -323,7 +324,7 @@ func (s *SubmissionServer) Close() error                { return s.srv.Close() }
 
 // AuthAdapter decouples smtpin from the authn package (avoid import cycles).
 type AuthAdapter struct {
-	AuthenticateAppPassword func(ctx context.Context, username, secret string) (userID, orgID string, err error)
+	AuthenticateAppPassword func(ctx context.Context, username, secret, ip string) (userID, orgID string, err error)
 }
 
 type subSession struct {
@@ -351,8 +352,18 @@ func (s *subSession) Auth(mech string) (sasl.Server, error) {
 }
 
 func (s *subSession) AuthPlain(username, password string) error {
-	userID, orgID, err := s.srv.Auth.AuthenticateAppPassword(context.Background(), username, password)
+	// Source IP for the failed-attempt lockout (register §1.6).
+	ip := ""
+	if s.conn != nil {
+		if nc := s.conn.Conn(); nc != nil {
+			ip = nc.RemoteAddr().String()
+		}
+	}
+	userID, orgID, err := s.srv.Auth.AuthenticateAppPassword(context.Background(), username, password, ip)
 	if err != nil {
+		if errors.Is(err, authn.ErrLocked) {
+			return &gosmtp.SMTPError{Code: 535, Message: "account locked: too many failed attempts"}
+		}
 		return &gosmtp.SMTPError{Code: 535, Message: "authentication failed (app passwords only)"}
 	}
 	s.userID = userID

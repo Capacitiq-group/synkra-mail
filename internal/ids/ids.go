@@ -129,6 +129,20 @@ func Parse(s string) (uuid.UUID, bool) {
 	return u, err == nil
 }
 
+// ParseTyped parses an id and enforces the expected type (build register §1.1):
+// a msg_ id passed where a folder id is required must be rejected, not silently
+// stripped. Bare uuids are still accepted (the DB stores bare uuids).
+func ParseTyped(s, prefix string) (uuid.UUID, bool) {
+	if i := strings.IndexByte(s, '_'); i >= 0 {
+		if s[:i] != prefix {
+			return uuid.Nil, false
+		}
+		s = s[i+1:]
+	}
+	u, err := uuid.Parse(s)
+	return u, err == nil
+}
+
 // Format renders a uuid with its prefix for API output.
 func Format(prefix string, u uuid.UUID) string {
 	return prefix + "_" + u.String()

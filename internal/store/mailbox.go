@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -100,6 +101,17 @@ func DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID) error {
 
 // ---- addresses (routable addresses; aliases are address rows, not mailboxes — Section 4.1) ----
 
+// reservedLocals: the RFC 2142 tier-0 role addresses (build register §1.5).
+// They stay platform-operated: no organisation may register them on the
+// platform domain, on any of its mail hosts or through the API.
+var reservedLocals = map[string]struct{}{
+	"postmaster": {}, "abuse": {}, "admin": {}, "hostmaster": {}, "webmaster": {}, "security": {},
+}
+
+// ErrReservedLocal is returned when an address claims one of those local parts
+// on the platform domain.
+var ErrReservedLocal = errors.New("local part is reserved on the platform domain")
+
 func CreateAddress(ctx context.Context, tx pgx.Tx, a *model.Address) error {
 	if a.Kind == "" {
 		a.Kind = "user"
@@ -108,6 +120,15 @@ func CreateAddress(ctx context.Context, tx pgx.Tx, a *model.Address) error {
 	// Aliases/forwards honour the explicit flag.
 	if a.Kind == "user" {
 		a.AllowSendAs = true
+	}
+	var isPlatform bool
+	if err := tx.QueryRow(ctx, `select is_platform from mail.domain where id=$1`, a.DomainID).Scan(&isPlatform); err != nil {
+		return notFound(err)
+	}
+	if isPlatform {
+		if _, taken := reservedLocals[strings.ToLower(a.Local)]; taken {
+			return ErrReservedLocal
+		}
 	}
 	_, err := tx.Exec(ctx, `insert into mail.address (id, org_id, domain_id, mailbox_id, local, kind, forward_target, is_primary, allow_send_as)
                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,

@@ -248,6 +248,62 @@ type ItemWithMessage struct {
 	Message model.Message
 }
 
+// ListItemsPage returns the newest `limit` live items in a folder, older pages
+// fetched by passing the smallest uid of the previous page as beforeUID (0 =
+// from the top). Returned in ascending uid order, like ListItems (register §1.8:
+// the API must not load the whole folder to keep the last 50).
+func ListItemsPage(ctx context.Context, q Querier, folderID uuid.UUID, beforeUID uint32, limit int) ([]ItemWithMessage, error) {
+	rows, err := q.Query(ctx, `select i.id, i.folder_id, i.message_id, i.uid, i.flags, i.deleted_at, i.created_at,
+                m.id, m.org_id, m.mailbox_id, m.blob_sha256, m.direction, coalesce(m.message_id::text,''), coalesce(m.in_reply_to::text,''),
+                m.refs, m.thread_id, coalesce(m.from_email::text,''), coalesce(m.from_name,''), m.to_addrs, m.cc_addrs,
+                coalesce(m.subject,''), m.snippet, coalesce(m.body_text,''), m.has_attachments, m.size_bytes, m.internal_date,
+                coalesce(m.spam_score,0), m.tracking_enabled
+                from mail.mailbox_item i join mail.message m on m.id = i.message_id
+                where i.folder_id=$1 and i.deleted_at is null and ($2::bigint = 0 or i.uid < $2)
+                order by i.uid desc limit $3`, folderID, beforeUID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ItemWithMessage
+	for rows.Next() {
+		var iwm ItemWithMessage
+		if err := scanItemWithMessage(rows, &iwm); err != nil {
+			return nil, err
+		}
+		out = append(out, iwm)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Newest-first from SQL; the API surface is ascending-uid (oldest of the
+	// page first), matching the previous whole-folder behaviour.
+	for a, b := 0, len(out)-1; a < b; a, b = a+1, b-1 {
+		out[a], out[b] = out[b], out[a]
+	}
+	return out, nil
+}
+
+// ThreadMailboxIDs lists the mailboxes that hold messages of a thread. Thread
+// notes and assignment must be guarded by membership of those mailboxes, not
+// just org membership (register §1.4).
+func ThreadMailboxIDs(ctx context.Context, q Querier, threadID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.Query(ctx, `select distinct mailbox_id from mail.message where thread_id=$1`, threadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 type itemScanner interface{ Scan(dest ...any) error }
 
 func scanItemWithMessage(row itemScanner, out *ItemWithMessage) error {

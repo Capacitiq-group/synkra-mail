@@ -58,6 +58,18 @@ func GetDomain(ctx context.Context, q Querier, id uuid.UUID) (*model.Domain, err
 	return scanDomain(row)
 }
 
+// GetOrgIDByDomainName returns the org that owns a domain name (nil for the
+// platform domain, which belongs to no org). Login uses this to resolve a
+// shared login e-mail to the organisation that owns its domain (register §1.2).
+func GetOrgIDByDomainName(ctx context.Context, q Querier, name string) (*uuid.UUID, error) {
+	var orgID *uuid.UUID
+	err := q.QueryRow(ctx, `select org_id from mail.domain where lower(name::text)=lower($1)`, name).Scan(&orgID)
+	if err != nil {
+		return nil, notFound(err)
+	}
+	return orgID, nil
+}
+
 func ListDomainsByOrg(ctx context.Context, q Querier, orgID uuid.UUID) ([]model.Domain, error) {
 	rows, err := q.Query(ctx, `select id, org_id, name, is_platform, status, ownership_token, dkim_selector,
 		coalesce(dkim_private_pem,''), coalesce(dkim_public_txt,''), verified_at, created_at

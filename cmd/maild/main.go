@@ -151,8 +151,8 @@ func main() {
 
 	if roles["submission"] {
 		subAuth := &smtpin.AuthAdapter{
-			AuthenticateAppPassword: func(ctx context.Context, username, secret string) (string, string, error) {
-				u, _, err := authSvc.AuthenticateAppPassword(ctx, username, secret)
+			AuthenticateAppPassword: func(ctx context.Context, username, secret, ip string) (string, string, error) {
+				u, _, err := authSvc.AuthenticateAppPassword(ctx, username, secret, ip)
 				if err != nil {
 					return "", "", err
 				}

@@ -23,6 +23,12 @@ var (
 	ErrSuspended           = errors.New("account suspended")
 	ErrAppPasswordLimit    = errors.New("app password limit reached (10 active max)")
 	ErrImpersonationDenied = errors.New("impersonation requires platform staff")
+	// ErrAmbiguousLogin: the login e-mail exists in more than one organisation
+	// and none can be preferred (register §1.2). Refused, never resolved by luck.
+	ErrAmbiguousLogin = errors.New("login e-mail exists in multiple organisations")
+	// ErrStaffImpersonation: staff accounts cannot be impersonated (register §1.7) —
+	// the audit log alone is not a privilege boundary.
+	ErrStaffImpersonation = errors.New("staff accounts cannot be impersonated")
 )
 
 // AuthContext is resolved from a verified session/token — never from client
@@ -50,6 +56,9 @@ type Service struct {
 }
 
 // Login verifies email+password with lockout (10 fails / 10 min per account and IP).
+// Login e-mails are unique per organisation, not globally (schema); when two
+// orgs share a login address the org that owns the address's domain wins, and a
+// truly ambiguous login is refused instead of silently picking one (register §1.2).
 func (s *Service) Login(ctx context.Context, email, password, ip, userAgent string) (*AuthContext, string, error) {
 	fails, err := store.CountRecentFailedLogins(ctx, s.Store.Pool, email, ip, "10 minutes")
 	if err != nil {
@@ -59,13 +68,18 @@ func (s *Service) Login(ctx context.Context, email, password, ip, userAgent stri
 		return nil, "", ErrLocked
 	}
 
-	u, err := store.GetUserByEmail(ctx, s.Store.Pool, email)
-	if errors.Is(err, store.ErrNotFound) {
+	users, err := store.ListUsersByEmail(ctx, s.Store.Pool, email)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, "", err
+	}
+	if len(users) == 0 {
 		store.RecordLoginAttempt(ctx, s.Store.Pool, email, ip, false)
 		return nil, "", ErrInvalidCredentials
 	}
-	if err != nil {
-		return nil, "", err
+	u, resolved := s.resolveLoginUser(ctx, users, email)
+	if !resolved {
+		store.RecordLoginAttempt(ctx, s.Store.Pool, email, ip, false)
+		return nil, "", ErrAmbiguousLogin
 	}
 	if u.Status != "active" || u.PasswordHash == "" {
 		store.RecordLoginAttempt(ctx, s.Store.Pool, email, ip, false)
@@ -82,6 +96,26 @@ func (s *Service) Login(ctx context.Context, email, password, ip, userAgent stri
 		return nil, "", err
 	}
 	return ac, token, nil
+}
+
+// resolveLoginUser picks the login identity deterministically: one match wins;
+// with several, the org that owns the e-mail's domain does. The platform domain
+// belongs to no org, so duplicates on it stay ambiguous (false).
+func (s *Service) resolveLoginUser(ctx context.Context, users []model.User, email string) (*model.User, bool) {
+	if len(users) == 1 {
+		return &users[0], true
+	}
+	if i := strings.LastIndexByte(email, '@'); i >= 0 {
+		orgID, err := store.GetOrgIDByDomainName(ctx, s.Store.Pool, email[i+1:])
+		if err == nil && orgID != nil {
+			for j := range users {
+				if users[j].OrgID == *orgID {
+					return &users[j], true
+				}
+			}
+		}
+	}
+	return nil, false
 }
 
 func (s *Service) createSession(ctx context.Context, u *model.User, kind, ip, userAgent string, adminID *uuid.UUID, ttl time.Duration) (*AuthContext, string, error) {
@@ -178,10 +212,21 @@ func (s *Service) CreateAppPassword(ctx context.Context, ac *AuthContext, name s
 }
 
 // AuthenticateAppPassword verifies an IMAP/submission login. The main account
-// password is never accepted on protocol ports (Section 6.1).
-func (s *Service) AuthenticateAppPassword(ctx context.Context, username, secret string) (*model.User, *model.AppPassword, error) {
+// password is never accepted on protocol ports (Section 6.1). Protocol-port
+// brute force shares the web login's failed-attempt lockout (register §1.6),
+// keyed by the login identity plus source IP when the caller knows it (ip ""
+// for servers that cannot see the peer, e.g. go-imap v2 sessions).
+func (s *Service) AuthenticateAppPassword(ctx context.Context, username, secret, ip string) (*model.User, *model.AppPassword, error) {
 	if secret == "" || len(secret) < 5 {
+		store.RecordLoginAttempt(ctx, s.Store.Pool, username, ip, false)
 		return nil, nil, ErrInvalidCredentials
+	}
+	fails, err := store.CountRecentFailedLogins(ctx, s.Store.Pool, username, ip, "10 minutes")
+	if err != nil {
+		return nil, nil, err
+	}
+	if fails >= s.Cfg.HTTP.LoginMaxFails {
+		return nil, nil, ErrLocked
 	}
 	prefix := secret[:4]
 	candidates, err := store.FindActiveAppPasswordByPrefix(ctx, s.Store.Pool, prefix)
@@ -202,10 +247,12 @@ func (s *Service) AuthenticateAppPassword(ctx context.Context, username, secret 
 			continue
 		}
 		if err := krypto.VerifyPassword(ap.PasswordHash, secret); err == nil {
+			store.RecordLoginAttempt(ctx, s.Store.Pool, username, ip, true)
 			store.TouchAppPassword(ctx, s.Store.Pool, ap.ID)
 			return u, ap, nil
 		}
 	}
+	store.RecordLoginAttempt(ctx, s.Store.Pool, username, ip, false)
 	return nil, nil, ErrInvalidCredentials
 }
 
@@ -224,6 +271,8 @@ func (s *Service) RevokeAppPassword(ctx context.Context, ac *AuthContext, apID u
 // ---- impersonation (Section 11.2) ----
 
 // Impersonate creates a 60-minute, audited, guard-railed staff session.
+// Staff accounts cannot be impersonated (register §1.7): a staff session in
+// someone else's hands bypasses every platform-admin boundary.
 func (s *Service) Impersonate(ctx context.Context, admin *model.User, targetUserID uuid.UUID, reason, ip, userAgent string) (token string, err error) {
 	if !admin.IsPlatformAdmin {
 		return "", ErrImpersonationDenied
@@ -231,6 +280,9 @@ func (s *Service) Impersonate(ctx context.Context, admin *model.User, targetUser
 	target, err := store.GetUser(ctx, s.Store.Pool, targetUserID)
 	if err != nil {
 		return "", err
+	}
+	if target.IsPlatformAdmin {
+		return "", ErrStaffImpersonation
 	}
 	ac, token, err := s.createSession(ctx, target, "impersonation", ip, userAgent, &admin.ID, 60*time.Minute)
 	if err != nil {

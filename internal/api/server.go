@@ -128,9 +128,17 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid or expired session")
 			return
 		}
-		if ac.Org.Status == "suspended" && !strings.HasPrefix(r.URL.Path, "/admin/") {
-			writeError(w, http.StatusForbidden, "forbidden", "organisation suspended")
-			return
+		if ac.Org.Status == "suspended" {
+			// A suspended org keeps exactly logout and the status read (register
+			// §1.3). The old exemption tested for an "/admin/" prefix that never
+			// occurs under /api/v1, so it was dead code and suspended orgs were
+			// over-blocked (unable even to log out).
+			p := r.URL.Path
+			if p != "/api/v1/auth/logout" && p != "/api/v1/me" {
+				writeErrorHint(w, http.StatusForbidden, "forbidden", "organisation suspended",
+					"the organisation is suspended; only logout and the status view are available until an administrator resumes it")
+				return
+			}
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxAuth, ac)))
 	})
@@ -180,14 +188,20 @@ type errBody struct {
 		Code      string `json:"code"`
 		Message   string `json:"message"`
 		RequestID string `json:"request_id"`
+		Hint      string `json:"hint,omitempty"` // what to do about it (register §1.10)
 	} `json:"error"`
 }
 
 func writeError(w http.ResponseWriter, status int, code, msg string) {
+	writeErrorHint(w, status, code, msg, "")
+}
+
+func writeErrorHint(w http.ResponseWriter, status int, code, msg, hint string) {
 	var b errBody
 	b.Error.Code = code
 	b.Error.Message = msg
 	b.Error.RequestID = uuid.NewString()
+	b.Error.Hint = hint
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(b)
@@ -214,11 +228,23 @@ func mapError(w http.ResponseWriter, err error) {
 	case errors.Is(err, outbound.ErrLimitExceeded):
 		writeError(w, http.StatusTooManyRequests, "limit_exceeded", err.Error())
 	case errors.Is(err, authn.ErrLocked):
-		writeError(w, http.StatusTooManyRequests, "account_locked", err.Error())
+		writeErrorHint(w, http.StatusTooManyRequests, "account_locked", err.Error(),
+			"wait 10 minutes; further failures extend the window")
 	case errors.Is(err, authn.ErrInvalidCredentials):
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", err.Error())
+	case errors.Is(err, authn.ErrAmbiguousLogin):
+		writeErrorHint(w, http.StatusConflict, "ambiguous_login", err.Error(),
+			"this login e-mail exists in more than one organisation; use the full mailbox address of your organisation or contact support")
+	case errors.Is(err, authn.ErrStaffImpersonation):
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
 	case errors.Is(err, authn.ErrAppPasswordLimit):
 		writeError(w, http.StatusBadRequest, "limit_exceeded", err.Error())
+	case errors.Is(err, store.ErrReservedLocal):
+		writeErrorHint(w, http.StatusConflict, "reserved_address", err.Error(),
+			"postmaster, abuse, admin, hostmaster, webmaster and security on the platform domain are platform-operated; choose another local part")
+	case errors.Is(err, errKeyReuse):
+		writeErrorHint(w, http.StatusUnprocessableEntity, "idempotency_key_reuse", err.Error(),
+			"repeat the exact same request body with this key, or send a fresh key")
 	default:
 		log.Printf("[api] internal error: %v", err)
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")

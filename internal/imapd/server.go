@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -121,8 +122,13 @@ func (s *session) Close() error {
 }
 
 func (s *session) Login(username, password string) error {
-	u, _, err := s.srv.auth.AuthenticateAppPassword(context.Background(), username, password)
+	// go-imap v2 beta.8 exposes no remote address to sessions, so the
+	// failed-attempt lockout is keyed by the login identity here (register §1.6).
+	u, _, err := s.srv.auth.AuthenticateAppPassword(context.Background(), username, password, "")
 	if err != nil {
+		if errors.Is(err, authn.ErrLocked) {
+			return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "account locked: too many failed attempts"}
+		}
 		return imapserver.ErrAuthFailed
 	}
 	mailboxes, err := store.MailboxesForUser(context.Background(), s.srv.st.Pool, u.ID)
