@@ -51,6 +51,8 @@ manageable first release.
 | P | Attachment API (§2.10) | The list + download routes serve existing attachment blobs; mimeutil.Att gained JSON tags so the send API reads content_type correctly. |
 | Q | Bare-LF wire normalisation (§3.7) | go-smtp passes DATA bytes through unmodified, so bare LF was stored and relayed verbatim; DeliverInbound and submission queueing now normalise to CRLF (RFC 5321), verified by a wire-level test. |
 | R | Restore drill (§3.5) | cmd/restorecheck dumps every mail table, rebuilds the schema from migrations in a scratch DB, restores, verifies counts and a write probe; the sandbox's embedded Postgres has no pg_dump, so the drill is dependency-free Go. Production keeps pg_dump + WAL archiving per the runbook. |
+| S | IMAP DELETE with children (§5.2) | A parent folder with child folders refuses DELETE with a clear NO instead of leaving a half-deleted hierarchy; CREATE auto-creates intermediate levels; RENAME moves children with the parent; LIST emits \HasChildren/\HasNoChildren. INBOX cannot be renamed or deleted. |
+| T | APPEND admission (§5.1) | APPEND now obeys the same admission as the send path: oversize is rejected with TOOBIG (the old reader silently truncated), the org storage quota gates the append, and bare LF is normalised like the wire paths. |
 
 ### Explicitly still pending
 

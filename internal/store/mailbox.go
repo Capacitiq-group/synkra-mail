@@ -393,3 +393,41 @@ func ListMembers(ctx context.Context, q Querier, mailboxID uuid.UUID) ([]MemberV
 	}
 	return out, rows.Err()
 }
+
+// RenameFolderWithChildren renames a folder and moves its child folders with
+// it (IMAP RENAME semantics, register §5.2): children keep their leaf name
+// under the new prefix. System folders are refused like RenameFolder does.
+func RenameFolderWithChildren(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID, oldName, newName string) error {
+	var special string
+	err := tx.QueryRow(ctx, `select coalesce(special_use,'') from mail.folder
+		where mailbox_id=$1 and name=$2`, mailboxID, oldName).Scan(&special)
+	if err != nil {
+		return notFound(err)
+	}
+	if special != "" {
+		return errors.New("system folders cannot be renamed")
+	}
+	// Children first (their names gain the new prefix), then the folder itself.
+	if _, err := tx.Exec(ctx, `update mail.folder set name=$3 || substring(name from length($1)+1)
+		where mailbox_id=$2 and name like $1 || '/%'`, oldName, mailboxID, newName); err != nil {
+		return err
+	}
+	ct, err := tx.Exec(ctx, `update mail.folder set name=$2 where mailbox_id=$3 and name=$1`,
+		oldName, newName, mailboxID)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// FolderHasChildren reports whether any folder's name sits below name
+// (like IMAP \HasChildren).
+func FolderHasChildren(ctx context.Context, q Querier, mailboxID uuid.UUID, name string) (bool, error) {
+	var n int
+	err := q.QueryRow(ctx, `select count(*) from mail.folder
+		where mailbox_id=$1 and name like $2 || '/%'`, mailboxID, name).Scan(&n)
+	return n > 0, err
+}

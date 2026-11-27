@@ -7,6 +7,7 @@ package imapd
 import (
 	"bytes"
 	"context"
+	"log"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"synkra.email/mail/internal/blob"
 	"synkra.email/mail/internal/config"
 	"synkra.email/mail/internal/events"
+	"synkra.email/mail/internal/ingest"
 	"synkra.email/mail/internal/mimeutil"
 	"synkra.email/mail/internal/model"
 	"synkra.email/mail/internal/store"
@@ -44,10 +46,14 @@ type Server struct {
 
 	mu     sync.Mutex
 	shared map[string]*sharedFolder // folderID → shared state (trackers + snapshot)
+
+	connMu     sync.Mutex
+	connCounts map[uuid.UUID]int // per-user open IMAP sessions (register §5.3)
 }
 
 func New(cfg *config.Config, st *store.Store, auth *authn.Service, blobs blob.Store, hub *events.Hub) *Server {
-	s := &Server{cfg: cfg, st: st, auth: auth, blobs: blobs, hub: hub, shared: map[string]*sharedFolder{}}
+	s := &Server{cfg: cfg, st: st, auth: auth, blobs: blobs, hub: hub,
+		shared: map[string]*sharedFolder{}, connCounts: map[uuid.UUID]int{}}
 	s.opts = imapserver.Options{
 		NewSession: func(c *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return &session{srv: s}, nil, nil
@@ -96,6 +102,7 @@ type session struct {
 	user    *model.User
 	mailbox *model.Mailbox // the user's own mailbox (v1 IMAP scope)
 	view    *view
+	counted bool // this session holds a slot in the per-user connection cap
 }
 
 // view is one session's selected-folder state.
@@ -117,6 +124,10 @@ func (s *session) Close() error {
 	if s.view != nil {
 		s.view.close()
 		s.view = nil
+	}
+	if s.counted && s.user != nil {
+		s.srv.releaseSessionSlot(s.user.ID)
+		s.counted = false
 	}
 	return nil
 }
@@ -146,9 +157,38 @@ func (s *session) Login(username, password string) error {
 	if own == nil {
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "no mailbox provisioned"}
 	}
+	// Per-user connection cap (register §5.3): the config existed, nothing
+	// enforced it. This is the lever against runaway clients.
+	if !s.srv.acquireSessionSlot(u.ID) {
+		return &imap.Error{Type: imap.StatusResponseTypeNo,
+			Text: "connection limit reached; close another IMAP session first"}
+	}
+	s.counted = true
 	s.user = u
 	s.mailbox = own
 	return nil
+}
+
+// acquireSessionSlot takes one of the user's IMAPMaxConnUser slots.
+func (srv *Server) acquireSessionSlot(userID uuid.UUID) bool {
+	srv.connMu.Lock()
+	defer srv.connMu.Unlock()
+	n := srv.connCounts[userID]
+	if n >= srv.cfg.HTTP.IMAPMaxConnUser {
+		return false
+	}
+	srv.connCounts[userID] = n + 1
+	return true
+}
+
+func (srv *Server) releaseSessionSlot(userID uuid.UUID) {
+	srv.connMu.Lock()
+	defer srv.connMu.Unlock()
+	if n := srv.connCounts[userID]; n <= 1 {
+		delete(srv.connCounts, userID)
+	} else {
+		srv.connCounts[userID] = n - 1
+	}
 }
 
 func (s *session) requireAuth() error {
@@ -202,9 +242,29 @@ func (s *session) Create(name string, options *imap.CreateOptions) error {
 	if strings.EqualFold(name, "INBOX") {
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "INBOX already exists"}
 	}
-	f := &model.Folder{ID: newID(), MailboxID: s.mailbox.ID, Name: name}
-	return s.srv.st.WithTx(context.Background(), func(tx store.Tx) error {
-		return store.CreateFolder(context.Background(), tx, f)
+	if name == "" {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "empty mailbox name"}
+	}
+	ctx := context.Background()
+	return s.srv.st.WithTx(ctx, func(tx store.Tx) error {
+		// IMAP CREATE creates missing intermediate levels (register §5.2):
+		// creating "Work/2026" must leave "Work" behind too.
+		parts := strings.Split(name, string(delimiter))
+		for i := range parts {
+			if parts[i] == "" {
+				return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "empty path segment"}
+			}
+			prefix := strings.Join(parts[:i+1], string(delimiter))
+			if _, err := store.GetFolderByName(ctx, tx, s.mailbox.ID, prefix); err == nil {
+				continue
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			if err := store.CreateFolder(ctx, tx, &model.Folder{ID: newID(), MailboxID: s.mailbox.ID, Name: prefix}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -216,6 +276,14 @@ func (s *session) Delete(name string) error {
 	if err != nil {
 		return err
 	}
+	if strings.EqualFold(name, "INBOX") {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "INBOX cannot be deleted"}
+	}
+	// IMAP DELETE must not orphan children (register §5.2): the client gets a
+	// clear NO instead of a half-deleted hierarchy.
+	if has, cerr := store.FolderHasChildren(context.Background(), s.srv.st.Pool, folder.MailboxID, folder.Name); cerr == nil && has {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "mailbox has child folders; delete them first"}
+	}
 	return s.srv.st.WithTx(context.Background(), func(tx store.Tx) error {
 		return store.DeleteFolder(context.Background(), tx, folder.ID)
 	})
@@ -225,12 +293,24 @@ func (s *session) Rename(name, newName string, options *imap.RenameOptions) erro
 	if err := s.requireAuth(); err != nil {
 		return err
 	}
+	newName = strings.TrimRight(newName, string(delimiter))
+	if strings.EqualFold(name, "INBOX") {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "INBOX cannot be renamed"}
+	}
+	if newName == "" || strings.EqualFold(newName, "INBOX") {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "bad target name"}
+	}
 	folder, err := s.resolveFolder(name)
 	if err != nil {
 		return err
 	}
+	if _, err := store.GetFolderByName(context.Background(), s.srv.st.Pool, folder.MailboxID, newName); err == nil {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "target mailbox already exists"}
+	}
 	return s.srv.st.WithTx(context.Background(), func(tx store.Tx) error {
-		return store.RenameFolder(context.Background(), tx, folder.ID, newName)
+		// Children move with the parent (register §5.2): renaming "Work" to
+		// "Business" renames "Work/2026" to "Business/2026".
+		return store.RenameFolderWithChildren(context.Background(), tx, folder.MailboxID, folder.Name, newName)
 	})
 }
 
@@ -271,6 +351,14 @@ func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 	if len(patterns) == 0 {
 		patterns = []string{"*"}
 	}
+	// \HasChildren per IMAP (register §5.2): clients managing folders need it.
+	parents := map[string]bool{}
+	for i := range folders {
+		name := folders[i].Name
+		for p := strings.LastIndexByte(name, byte(delimiter)); p > 0; p = strings.LastIndexByte(name[:p], byte(delimiter)) {
+			parents[name[:p]] = true
+		}
+	}
 	for i := range folders {
 		f := &folders[i]
 		matched := false
@@ -289,6 +377,11 @@ func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 		data := &imap.ListData{Mailbox: f.Name, Delim: delimiter}
 		if f.Subscribed {
 			data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
+		}
+		if parents[f.Name] {
+			data.Attrs = append(data.Attrs, imap.MailboxAttrHasChildren)
+		} else {
+			data.Attrs = append(data.Attrs, imap.MailboxAttrHasNoChildren)
 		}
 		switch f.SpecialUse {
 		case model.FolderInbox:
@@ -374,10 +467,26 @@ func (s *session) Append(name string, r imap.LiteralReader, options *imap.Append
 	}
 	raw, err := readLimited(r, s.srv.cfg.MaxMessageBytes)
 	if err != nil {
-		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "message too large"}
+		if errors.Is(err, errMessageTooLarge) {
+			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTooBig,
+				Text: "message too large"}
+		}
+		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "append failed"}
 	}
+	// Storage policy (register §5.1): APPEND obeys the same quota the send
+	// path enforces — a client cannot bypass it through the protocol port.
+	deps := &ingest.Deps{Store: s.srv.st, Blobs: s.srv.blobs, Cfg: s.srv.cfg}
+	state, qerr := deps.CheckQuota(context.Background(), s.user.OrgID)
+	if qerr != nil {
+		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "append failed"}
+	}
+	if state.Full || state.BeyondGrace {
+		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "storage quota exceeded"}
+	}
+	raw = mimeutil.NormalizeWire(raw) // register §3.7: bare LF never lands
 	item, uid, err := s.srv.appendMessage(context.Background(), folder, raw, options.Flags, options.Time)
 	if err != nil {
+		log.Printf("[imap] append to %s for user %s: %v", folder.Name, s.user.ID, err)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "append failed"}
 	}
 	_ = item
@@ -702,10 +811,18 @@ func toImapFlags(flags []string) []imap.Flag {
 	return out
 }
 
+var errMessageTooLarge = errors.New("message exceeds the size limit")
+
+// readLimited rejects oversize instead of silently truncating (register §5.1):
+// a truncated APPEND used to store a corrupt message.
 func readLimited(r imap.LiteralReader, limit int64) ([]byte, error) {
 	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(io.LimitReader(r, limit)); err != nil {
+	n, err := io.Copy(&buf, io.LimitReader(r, limit+1))
+	if err != nil {
 		return nil, err
+	}
+	if n > limit {
+		return nil, errMessageTooLarge
 	}
 	return buf.Bytes(), nil
 }
