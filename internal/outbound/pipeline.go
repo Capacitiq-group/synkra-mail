@@ -4,6 +4,7 @@ package outbound
 
 import (
 	"bytes"
+	"encoding/json"
 	"context"
 	"errors"
 	"fmt"
@@ -433,6 +434,15 @@ func (p *Pipeline) storeOutgoing(ctx context.Context, orgID, fromMailboxID, user
 			return ierr
 		}
 		outID = msg.ID
+		// Delivery event log (register §7.3): admission and queueing share this
+		// transaction, so "queued" is the machine's first locked-in state.
+		detail, _ := json.Marshal(map[string]any{"recipients": len(deliver)})
+		if err := store.RecordDeliveryEvent(ctx, tx, &model.DeliveryEvent{
+			ID: uuid.New(), MessageID: outID, OrgID: orgID, MailboxID: &fromMailboxID,
+			State: "queued", Detail: detail,
+		}); err != nil {
+			return err
+		}
 
 		for _, a := range in.Attachments {
 			asha, asize, aerr := p.Blobs.Put(ctx, bytes.NewReader(a.Content))

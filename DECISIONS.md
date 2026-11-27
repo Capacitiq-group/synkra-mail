@@ -53,6 +53,7 @@ manageable first release.
 | R | Restore drill (§3.5) | cmd/restorecheck dumps every mail table, rebuilds the schema from migrations in a scratch DB, restores, verifies counts and a write probe; the sandbox's embedded Postgres has no pg_dump, so the drill is dependency-free Go. Production keeps pg_dump + WAL archiving per the runbook. |
 | S | IMAP DELETE with children (§5.2) | A parent folder with child folders refuses DELETE with a clear NO instead of leaving a half-deleted hierarchy; CREATE auto-creates intermediate levels; RENAME moves children with the parent; LIST emits \HasChildren/\HasNoChildren. INBOX cannot be renamed or deleted. |
 | T | APPEND admission (§5.1) | APPEND now obeys the same admission as the send path: oversize is rejected with TOOBIG (the old reader silently truncated), the org storage quota gates the append, and bare LF is normalised like the wire paths. |
+| U | Delivery event log schema (§7.3, decision 17.4) | Locked in migration 005: mail.delivery_event (message_id, org_id, mailbox_id, state, detail, occurred_at) with states queued → delivered | bounced | deferred; "submitted"/"authenticated" fold into "queued" for v1 because admission and queueing share one transaction. Rows are written inside the transactions that move the jobs, so trace and truth cannot diverge. |
 
 ### Explicitly still pending
 

@@ -184,10 +184,24 @@ func (w *Worker) completeJob(ctx context.Context, j *model.DeliveryJob, code int
 		if err := store.MarkJobDelivered(ctx, tx, j.ID, fmt.Sprintf("%d", code), msg); err != nil {
 			return err
 		}
-		return store.RecordDSN(ctx, tx, &model.DSN{
+		if err := store.RecordDSN(ctx, tx, &model.DSN{
 			ID: uuid.New(), DeliveryJobID: j.ID, Kind: "success",
 			SMTPCode: fmt.Sprintf("%d", code), Reason: msg,
-		})
+		}); err != nil {
+			return err
+		}
+		return recordJobEvent(ctx, tx, j, "delivered", fmt.Sprintf("%d", code), msg)
+	})
+}
+
+// recordJobEvent appends the delivery event log row inside the same
+// transaction that moves the job (register §7.3) — trace and truth stay one.
+func recordJobEvent(ctx context.Context, tx store.Tx, j *model.DeliveryJob, state, code, msg string) error {
+	detail, _ := json.Marshal(map[string]any{"code": code, "message": msg})
+	mbID := j.MailboxID
+	return store.RecordDeliveryEvent(ctx, tx, &model.DeliveryEvent{
+		ID: uuid.New(), MessageID: j.MessageID, OrgID: j.OrgID, MailboxID: &mbID,
+		State: state, Detail: detail,
 	})
 }
 
@@ -207,7 +221,10 @@ func (w *Worker) deferJob(ctx context.Context, j *model.DeliveryJob, attempts in
 	}
 	next := time.Now().Add(delay)
 	err := w.Pipeline.Store.WithTx(ctx, func(tx store.Tx) error {
-		return store.DeferJob(ctx, tx, j.ID, attempts, next, code, msg)
+		if err := store.DeferJob(ctx, tx, j.ID, attempts, next, code, msg); err != nil {
+			return err
+		}
+		return recordJobEvent(ctx, tx, j, "deferred", code, "next "+next.Format(time.RFC3339))
 	})
 	if err != nil {
 		return err
@@ -242,7 +259,10 @@ func (w *Worker) hardBounce(ctx context.Context, j *model.DeliveryJob, org *mode
 			return err
 		}
 		// Circuit breaker (owner decision: 5% hard-bounce rate, rolling window).
-		return w.Pipeline.checkBreakerLocked(ctx, tx, org, j.MailboxID)
+		if err := w.Pipeline.checkBreakerLocked(ctx, tx, org, j.MailboxID); err != nil {
+			return err
+		}
+		return recordJobEvent(ctx, tx, j, "bounced", fmt.Sprintf("%d", code), msg)
 	})
 	if err != nil {
 		return err
@@ -259,10 +279,13 @@ func (w *Worker) finalBounce(ctx context.Context, j *model.DeliveryJob, code, ms
 			return err
 		}
 		hard := false
-		return store.RecordDSN(ctx, tx, &model.DSN{
+		if err := store.RecordDSN(ctx, tx, &model.DSN{
 			ID: uuid.New(), DeliveryJobID: j.ID, Kind: "bounce", IsHard: &hard,
 			SMTPCode: code, Reason: msg,
-		})
+		}); err != nil {
+			return err
+		}
+		return recordJobEvent(ctx, tx, j, "bounced", code, msg)
 	})
 	if err != nil {
 		return err

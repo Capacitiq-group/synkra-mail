@@ -237,3 +237,33 @@ func ListSuppressionAll(ctx context.Context, q Querier, limit int) ([]model.Supp
 	}
 	return out, rows.Err()
 }
+
+// RecordDeliveryEvent appends one state-machine row (register §7.3: the most
+// consequential schema in the product — locked in migration 005).
+func RecordDeliveryEvent(ctx context.Context, tx pgx.Tx, e *model.DeliveryEvent) error {
+	_, err := tx.Exec(ctx, `insert into mail.delivery_event (id, message_id, org_id, mailbox_id, state, detail)
+		values ($1,$2,$3,$4,$5,$6)`,
+		e.ID, e.MessageID, e.OrgID, optUUID(e.MailboxID), e.State, e.Detail)
+	return err
+}
+
+// DeliveryEventsForMessage returns the message's journey in order.
+func DeliveryEventsForMessage(ctx context.Context, q Querier, messageID uuid.UUID) ([]model.DeliveryEvent, error) {
+	rows, err := q.Query(ctx, `select id, message_id, org_id, mailbox_id, state, coalesce(detail,'{}'::jsonb), occurred_at
+		from mail.delivery_event where message_id=$1 order by occurred_at, id`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.DeliveryEvent
+	for rows.Next() {
+		var e model.DeliveryEvent
+		var detail []byte
+		if err := rows.Scan(&e.ID, &e.MessageID, &e.OrgID, &e.MailboxID, &e.State, &detail, &e.OccurredAt); err != nil {
+			return nil, err
+		}
+		e.Detail = detail
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}

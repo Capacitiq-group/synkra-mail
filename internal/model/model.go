@@ -334,3 +334,15 @@ type Idempotency struct {
 	Response    []byte // raw JSON, stored as jsonb
 	CreatedAt   time.Time
 }
+
+// DeliveryEvent is one row of the delivery state machine (build register §7.3):
+// queued → delivered | bounced | deferred, per message, in order.
+type DeliveryEvent struct {
+	ID         uuid.UUID
+	MessageID  uuid.UUID
+	OrgID      uuid.UUID
+	MailboxID  *uuid.UUID
+	State      string
+	Detail     []byte // jsonb
+	OccurredAt time.Time
+}

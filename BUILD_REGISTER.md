@@ -11,7 +11,13 @@
 | 2 | §2 Missing endpoints (2.1–2.13) | **done** (2.1–2.11 routes + tests; 2.12–2.13 verified, alerting lands with phase 3) | this commit | 2026-11-26 |
 | 3 | §3 Operations, packaging and verification (3.1–3.10) | **done** (3.1 janitor; 3.2+3.8 CI; 3.3 Dockerfile; 3.4 Makefile; 3.5 runbook + tested restore drill; 3.6 alerting rules incl. 2.12; 3.7 bare-LF verified on the wire + fixed; 3.9 SBOM+govulncheck in CI; 3.10 logging audit + policy) | this commit | 2026-11-26 |
 | 4 | §5 IMAP completeness (5.1–5.3) | **done** (5.1 oversize rejected instead of truncated + quota enforced on APPEND; 5.2 CREATE intermediates, DELETE refuses parents, RENAME moves children, LIST \HasChildren; 5.3 per-user connection cap enforced) | this commit | 2026-11-26 |
-| 5 | §7.3 delivery event log schema (decision 17.4) | planned | — | — |
+| 5 | §7.3 delivery event log schema (decision 17.4) | **done** (migration 005 locks the schema; emission wired into the queue/deliver/defer/bounce transactions; E2E test) | this commit | 2026-11-26 |
+| 6 | §8 security architecture + §9 POPIA engineering (9.1-9.9) | planned — decisions mostly recorded; the engineering needs the auth-service split, per-tenant keys, breach-scoping queries over the event log | — | — |
+| 7 | §6 frontend (webmail, admin console, onboarding; API contract first) | planned — every backend prerequisite the UI needs now exists (2.10 attachments, 1.8 pagination, 2.8 revoke-sessions, 2.5 password change); the OpenAPI spec and the client are next | — | — |
+| 8 | §4b authoritative DNS service | planned — a separate service with its own owner; DnsService interface + zone templates per the register | — | — |
+| 9 | §10 Oner integration + §11 billing/VAT | planned — DomainService adapter abstraction, PayFast-first rails; contracts are owner items | — | — |
+| 10 | §12 feature register (P2): deliverability dashboard, aliases, signatures, unsubscribe/newsletters, OOO/rules, shared mailboxes | planned — build on the primitives (address model, metadata store, rules engine) decided in §17.2/17.3 | — | — |
+| 11 | §13-§15 (P3/P4) differentiators, suite, SA positioning | planned, post-launch per the register | — | — |
 
 Notes kept with the status:
 
