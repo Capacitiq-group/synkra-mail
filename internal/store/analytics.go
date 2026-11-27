@@ -13,15 +13,15 @@ import (
 
 // DeliverabilityStats: the org's sending funnel over a window.
 type DeliverabilityStats struct {
-	Sent        int64           `json:"sent"`         // delivery jobs created
-	Delivered   int64           `json:"delivered"`    // jobs that completed delivered
-	Bounced     int64           `json:"bounced"`      // hard bounces (DSN kind=bounce, is_hard)
-	SoftExpired int64           `json:"soft_expired"` // retries exhausted
-	Deferred    int64           `json:"deferred"`     // currently queued/deferred/in flight
-	Suppressed  int64           `json:"suppressed"`   // suppression rows
+	Sent         int64          `json:"sent"`         // delivery jobs created
+	Delivered    int64          `json:"delivered"`    // jobs that completed delivered
+	Bounced      int64          `json:"bounced"`      // hard bounces (DSN kind=bounce, is_hard)
+	SoftExpired  int64          `json:"soft_expired"` // retries exhausted
+	Deferred     int64          `json:"deferred"`     // currently queued/deferred/in flight
+	Suppressed   int64          `json:"suppressed"`   // suppression rows
 	DeliveryRate float64        `json:"delivery_rate"`
-	ByDomain    []DomainFunnel  `json:"by_domain"`
-	WindowDays  int             `json:"window_days"`
+	ByDomain     []DomainFunnel `json:"by_domain"`
+	WindowDays   int            `json:"window_days"`
 }
 
 type DomainFunnel struct {

@@ -273,7 +273,7 @@ func (s *stack) provisionTenant(t *testing.T, name string) (*model.Org, *model.U
 
 func (s *stack) login(t *testing.T, email, password string) string {
 	t.Helper()
-	_, token, err := s.auth.Login(context.Background(), email, password, "127.0.0.1", "e2e-test")
+	_, token, err := s.auth.Login(context.Background(), email, password, "127.0.0.1", "e2e-test", "")
 	if err != nil {
 		t.Fatalf("login %s: %v", email, err)
 	}

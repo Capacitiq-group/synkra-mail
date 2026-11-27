@@ -38,13 +38,30 @@ func (s *Server) Routes() http.Handler {
 	r.Route("/api/v1", func(r chi.Router) {
 		// Public
 		r.Post("/auth/login", s.handleLogin)
+		r.Post("/auth/verify-email", s.handleVerifyEmail)
 
-		// Session-authenticated
+		// Session-authenticated. A default request-body ceiling applies
+		// (audit item 5: /auth/login and the tracker endpoint read bodies
+		// with no limit at all); /send caps itself higher.
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireSession)
+			r.Use(s.limitBody(1 << 20)) // 1 MiB default JSON envelope
 			r.Get("/me", s.handleMe)
 			r.Post("/auth/logout", s.handleLogout)
 			r.Post("/me/password", s.handleChangeOwnPassword)
+
+			// MFA (audit item 3), sessions, verification.
+			r.Post("/me/mfa/enrol", s.handleMFAEnrol)
+			r.Post("/me/mfa/activate", s.handleMFAActivate)
+			r.Post("/me/mfa/disable", s.handleMFADisable)
+			r.Get("/me/sessions", s.handleListSessions)
+			r.Post("/me/sessions/{id}/revoke", s.handleRevokeSession)
+			r.Post("/me/verify-email", s.handleRequestEmailVerification)
+
+			// Suppression management + owner-side resume (audit item 18).
+			r.Get("/suppression", s.handleListSuppression)
+			r.Delete("/suppression/{email}", s.handleDeleteSuppression)
+			r.Post("/mailboxes/{id}/resume", s.handleResumeOwnMailbox)
 
 			// Org users and shared mailboxes (register §2.6-2.9).
 			r.Get("/org/users", s.handleListOrgUsers)
@@ -118,16 +135,35 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/domains", s.handleCreateDomain)
 			r.Post("/domains/{id}/verify", s.handleVerifyDomain)
 			r.Get("/domains/{id}/dns", s.handleDomainDNS)
+			r.Post("/domains/{id}/rotate-dkim", s.handleStageDKIMRotation)
+			r.Post("/domains/{id}/activate-dkim", s.handleActivateDKIMRotation)
 
 			r.Get("/org", s.handleGetOrg)
 			r.Put("/org/tracking", s.handleSetTracking)
 			r.Post("/threads/{id}/note", s.handleThreadNote)
 			r.Post("/threads/{id}/assign", s.handleThreadAssign)
 
-			r.Post("/users/invite", s.handleCreateUser) // org admin adds mailboxes
+			// Backdoor paths: impersonated sessions must never reach these —
+			// a chosen password, a silent forward, a registered domain or an
+			// exfil webhook outlives the session (audit item 3).
+			r.Group(func(r chi.Router) {
+				r.Use(s.requireNotImpersonating)
+				r.Post("/users/invite", s.handleCreateUser)
+				r.Post("/org/webhooks", s.handleCreateWebhook)
+				r.Put("/org/tracking", s.handleSetTracking)
+				r.Post("/org/shared-mailboxes/{id}/members", s.handleAddSharedMailboxMember)
+				r.Delete("/org/shared-mailboxes/{id}/members", s.handleRemoveSharedMailboxMember)
+				r.Post("/addresses", s.handleCreateAddress)
+				r.Post("/domains", s.handleCreateDomain)
+				r.Post("/org/api-keys", s.handleCreateAPIKey)
+				r.Post("/app-passwords", s.handleCreateAppPassword)
+				r.Post("/me/password", s.handleChangeOwnPassword)
+			})
 		})
 
-		// Platform staff (admin portal — Section 11)
+		// Platform staff (admin portal — Section 11). Impersonation and
+		// API-key sessions never pass: staff actions must come from a real
+		// staff login, attributed to the right human (audit item 3).
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireStaff)
 			r.Get("/admin/orgs", s.handleAdminListOrgs)
@@ -147,7 +183,8 @@ func (s *Server) Routes() http.Handler {
 		})
 
 		// Internal: the isolated tracker posts events here (HMAC-authenticated —
-		// it holds no database credentials, Section 9.1).
+		// it holds no database credentials, Section 9.1). Body capped BEFORE
+		// the signature check reads it (audit item 5).
 		r.Post("/internal/tracking/events", s.handleInternalTrackingEvent)
 	})
 
@@ -216,8 +253,45 @@ func (s *Server) requireStaff(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "forbidden", "staff only")
 			return
 		}
+		// Staff actions must be attributed to a real staff login (audit item 3):
+		// an impersonation session acts as the TARGET user (never staff, but
+		// the attribution would still be wrong), and API keys are machine
+		// identities — neither may drive the admin portal.
+		if ac.Session != nil && ac.Session.Kind != "web" {
+			writeError(w, http.StatusForbidden, "forbidden", "admin actions require a staff web session")
+			return
+		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxAuth, ac)))
 	})
+}
+
+// requireNotImpersonating: the backdoor-closure middleware (audit item 3).
+// Impersonated sessions are support windows into one tenant; they must never
+// mint credentials, forward mail, register domains, grant mailbox access,
+// wire exfil webhooks or flip tracking.
+func (s *Server) requireNotImpersonating(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ac := authFrom(r.Context()); ac != nil && ac.Impersonating() {
+			writeError(w, http.StatusForbidden, "forbidden",
+				"impersonated sessions cannot perform this action — end impersonation or use the admin console")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// limitBody caps request bodies for everything that reads one (audit item 5:
+// login and the internal tracker endpoint read unbounded bodies). /send
+// raises its own cap around the message limit.
+func (s *Server) limitBody(n int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, n)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func bearer(r *http.Request) string {
@@ -285,7 +359,17 @@ func mapError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusTooManyRequests, "limit_exceeded", err.Error())
 	case errors.Is(err, authn.ErrLocked):
 		writeErrorHint(w, http.StatusTooManyRequests, "account_locked", err.Error(),
-			"wait 10 minutes; further failures extend the window")
+			"wait for the lockout to expire; further failures extend the window")
+	case errors.Is(err, authn.ErrRateLimited):
+		writeErrorHint(w, http.StatusTooManyRequests, "rate_limited", err.Error(),
+			"too many failed attempts from this source address; wait before retrying")
+	case errors.Is(err, authn.ErrTOTPRequired):
+		writeErrorHint(w, http.StatusUnauthorized, "mfa_required", err.Error(),
+			"repeat the login with the totp_code field from your authenticator app")
+	case errors.Is(err, authn.ErrTOTPInvalid):
+		writeError(w, http.StatusUnauthorized, "mfa_invalid", err.Error())
+	case errors.Is(err, authn.ErrMFANotEnrolled), errors.Is(err, authn.ErrMFAAlreadyEnabled):
+		writeError(w, http.StatusConflict, "mfa_state", err.Error())
 	case errors.Is(err, authn.ErrInvalidCredentials):
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", err.Error())
 	case errors.Is(err, authn.ErrAmbiguousLogin):
@@ -299,7 +383,10 @@ func mapError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "limit_exceeded", err.Error())
 	case errors.Is(err, store.ErrReservedLocal):
 		writeErrorHint(w, http.StatusConflict, "reserved_address", err.Error(),
-			"postmaster, abuse, admin, hostmaster, webmaster and security on the platform domain are platform-operated; choose another local part")
+			"platform role addresses (postmaster, abuse, admin, dmarc-reports, noreply, mailer-daemon and friends) are platform-operated; choose another local part")
+	case errors.Is(err, store.ErrInvalidDomain):
+		writeErrorHint(w, http.StatusBadRequest, "invalid_domain", err.Error(),
+			"use a registrable FQDN: lowercase labels, hyphens not leading/trailing, a lettered TLD")
 	case errors.Is(err, errKeyReuse):
 		writeErrorHint(w, http.StatusUnprocessableEntity, "idempotency_key_reuse", err.Error(),
 			"repeat the exact same request body with this key, or send a fresh key")

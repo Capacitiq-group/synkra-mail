@@ -300,7 +300,7 @@ func (s *Server) handleAdminImpersonate(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad user_id")
 		return
 	}
-	token, err := s.Auth.Impersonate(r.Context(), ac.User, uid, req.Reason, remoteIP(r), r.UserAgent())
+	token, err := s.Auth.Impersonate(r.Context(), ac.User, uid, req.Reason, s.remoteIP(r), r.UserAgent())
 	if err != nil {
 		mapError(w, err)
 		return

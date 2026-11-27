@@ -135,15 +135,15 @@ func RecordAutoReply(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID, sender
 // ---- inbound routing rules (register §12d) ----
 
 type MailboxRule struct {
-	ID              uuid.UUID
-	MailboxID       uuid.UUID
-	Position        int
-	Enabled         bool
-	MatchFrom       string
-	MatchSubject    string
-	ActionFolderID  *uuid.UUID
-	ActionMarkRead  bool
-	CreatedAt       time.Time
+	ID             uuid.UUID
+	MailboxID      uuid.UUID
+	Position       int
+	Enabled        bool
+	MatchFrom      string
+	MatchSubject   string
+	ActionFolderID *uuid.UUID
+	ActionMarkRead bool
+	CreatedAt      time.Time
 }
 
 func ListRules(ctx context.Context, q Querier, mailboxID uuid.UUID) ([]MailboxRule, error) {

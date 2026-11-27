@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
@@ -185,7 +186,44 @@ type ComposeInput struct {
 
 // Build renders an RFC 822 message (quoted-printable text, multipart when
 // attachments/HTML exist). Message-ID is minted here and returned.
+// Header-injection rule (audit item 9): every caller-supplied header value is
+// CR/LF-free before it reaches the wire — in_reply_to and attachment
+// content types carried raw bytes before, which forged extra headers.
 func Build(in ComposeInput) (raw []byte, messageID string, err error) {
+	for _, v := range []string{in.Subject, in.InReplyTo, in.ListUnsubscribe, in.ListID} {
+		if err := checkNoNewlines(v); err != nil {
+			return nil, "", err
+		}
+	}
+	for _, r := range in.References {
+		if err := checkNoNewlines(r); err != nil {
+			return nil, "", err
+		}
+	}
+	for _, a := range in.Attachments {
+		if err := checkNoNewlines(a.ContentType); err != nil {
+			return nil, "", fmt.Errorf("attachment content-type: %w", err)
+		}
+		if err := checkNoNewlines(a.Filename); err != nil {
+			return nil, "", fmt.Errorf("attachment filename: %w", err)
+		}
+		if err := checkNoNewlines(a.ContentID); err != nil {
+			return nil, "", fmt.Errorf("attachment content-id: %w", err)
+		}
+	}
+	if err := checkNoNewlines(in.From.Email); err != nil {
+		return nil, "", err
+	}
+	for _, l := range [][]Addr{in.To, in.Cc, in.Bcc} {
+		for _, a := range l {
+			if err := checkNoNewlines(a.Email); err != nil {
+				return nil, "", err
+			}
+			if err := checkNoNewlines(a.Name); err != nil {
+				return nil, "", err
+			}
+		}
+	}
 	if in.Date.IsZero() {
 		in.Date = time.Now()
 	}
@@ -225,16 +263,18 @@ func Build(in ComposeInput) (raw []byte, messageID string, err error) {
 	}
 
 	hasAttachments := false
+	hasInlines := false
 	for _, a := range in.Attachments {
-		if !a.IsInline {
+		if a.IsInline {
+			hasInlines = true
+		} else {
 			hasAttachments = true
-			break
 		}
 	}
 
 	var buf bytes.Buffer
 
-	if !hasAttachments && len(in.HTML) == 0 {
+	if !hasAttachments && !hasInlines && len(in.HTML) == 0 {
 		h.Set("Content-Type", "text/plain; charset=utf-8")
 		h.Set("Content-Transfer-Encoding", "quoted-printable")
 		if err := writeHeader(&buf, h); err != nil {
@@ -259,47 +299,76 @@ func Build(in ComposeInput) (raw []byte, messageID string, err error) {
 	mw := multipart.NewWriter(&buf)
 	mw.SetBoundary(boundary)
 
-	// Body part: multipart/alternative when HTML present, else plain text part.
-	if len(in.HTML) > 0 {
-		altBoundary := "synkra-alt-" + uuid.NewString()
-		hdr := textproto.MIMEHeader{}
-		hdr.Set("Content-Type", fmt.Sprintf("multipart/alternative; boundary=%q", altBoundary))
-		pw, err := mw.CreatePart(hdr)
+	// Body part: plain text, multipart/alternative, or (with inline images)
+	// multipart/related so inline parts stay inline instead of being dropped
+	// (audit item 9: inline attachments vanished from API-sent mail while the
+	// Sent copy still recorded them).
+	altBoundary := "synkra-alt-" + uuid.NewString()
+	var bodyHeader textproto.MIMEHeader
+	switch {
+	case len(in.HTML) > 0 && hasInlines:
+		relBoundary := "synkra-rel-" + uuid.NewString()
+		relHdr := textproto.MIMEHeader{}
+		relHdr.Set("Content-Type", fmt.Sprintf("multipart/related; boundary=%q; type=%q", relBoundary, "multipart/alternative"))
+		relW, err := mw.CreatePart(relHdr)
 		if err != nil {
 			return nil, "", err
 		}
-		altW := multipart.NewWriter(pw)
-		altW.SetBoundary(altBoundary)
-		ph := textproto.MIMEHeader{}
-		ph.Set("Content-Type", "text/plain; charset=utf-8")
-		ph.Set("Content-Transfer-Encoding", "quoted-printable")
-		p1, _ := altW.CreatePart(ph)
-		q1 := quotedprintable.NewWriter(p1)
-		q1.Write([]byte(in.Text))
-		q1.Close()
-		ph2 := textproto.MIMEHeader{}
-		ph2.Set("Content-Type", "text/html; charset=utf-8")
-		ph2.Set("Content-Transfer-Encoding", "quoted-printable")
-		p2, _ := altW.CreatePart(ph2)
-		q2 := quotedprintable.NewWriter(p2)
-		q2.Write([]byte(in.HTML))
-		q2.Close()
-		altW.Close()
-	} else {
+		related := multipart.NewWriter(relW)
+		related.SetBoundary(relBoundary)
+		altPart, err := related.CreatePart(textproto.MIMEHeader{
+			"Content-Type": []string{fmt.Sprintf("multipart/alternative; boundary=%q", altBoundary)},
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		if err := writeAlternative(altPart, in, altBoundary); err != nil {
+			return nil, "", err
+		}
+		for _, a := range in.Attachments {
+			if !a.IsInline {
+				continue
+			}
+			if err := writeInlinePart(related, a); err != nil {
+				return nil, "", err
+			}
+		}
+		if err := related.Close(); err != nil {
+			return nil, "", err
+		}
+		bodyHeader = nil
+	case len(in.HTML) > 0:
+		bodyHeader = textproto.MIMEHeader{
+			"Content-Type": []string{fmt.Sprintf("multipart/alternative; boundary=%q", altBoundary)},
+		}
+		p, err := mw.CreatePart(bodyHeader)
+		if err != nil {
+			return nil, "", err
+		}
+		if err := writeAlternative(p, in, altBoundary); err != nil {
+			return nil, "", err
+		}
+	default:
 		hdr := textproto.MIMEHeader{}
 		hdr.Set("Content-Type", "text/plain; charset=utf-8")
 		hdr.Set("Content-Transfer-Encoding", "quoted-printable")
-		pw, err := mw.CreatePart(hdr)
+		p, err := mw.CreatePart(hdr)
 		if err != nil {
 			return nil, "", err
 		}
-		qp := quotedprintable.NewWriter(pw)
+		qp := quotedprintable.NewWriter(p)
 		qp.Write([]byte(in.Text))
 		qp.Close()
 	}
 
 	for _, a := range in.Attachments {
+		if a.IsInline && len(in.HTML) > 0 {
+			continue // already written inside multipart/related
+		}
 		if a.IsInline {
+			if err := writeInlinePart(mw, a); err != nil {
+				return nil, "", err
+			}
 			continue
 		}
 		hdr := textproto.MIMEHeader{}
@@ -323,6 +392,89 @@ func Build(in ComposeInput) (raw []byte, messageID string, err error) {
 		return nil, "", err
 	}
 	return buf.Bytes(), messageID, nil
+}
+
+// writeAlternative writes the text/plain + text/html pair into w.
+func writeAlternative(w io.Writer, in ComposeInput, altBoundary string) error {
+	altW := multipart.NewWriter(w)
+	altW.SetBoundary(altBoundary)
+	ph := textproto.MIMEHeader{}
+	ph.Set("Content-Type", "text/plain; charset=utf-8")
+	ph.Set("Content-Transfer-Encoding", "quoted-printable")
+	p1, err := altW.CreatePart(ph)
+	if err != nil {
+		return err
+	}
+	q1 := quotedprintable.NewWriter(p1)
+	q1.Write([]byte(in.Text))
+	q1.Close()
+	ph2 := textproto.MIMEHeader{}
+	ph2.Set("Content-Type", "text/html; charset=utf-8")
+	ph2.Set("Content-Transfer-Encoding", "quoted-printable")
+	p2, err := altW.CreatePart(ph2)
+	if err != nil {
+		return err
+	}
+	q2 := quotedprintable.NewWriter(p2)
+	q2.Write([]byte(in.HTML))
+	q2.Close()
+	return altW.Close()
+}
+
+// writeInlinePart writes one inline (content-id referenced) part.
+func writeInlinePart(w *multipart.Writer, a Att) error {
+	hdr := textproto.MIMEHeader{}
+	if a.ContentType != "" {
+		hdr.Set("Content-Type", a.ContentType)
+	} else {
+		hdr.Set("Content-Type", "application/octet-stream")
+	}
+	hdr.Set("Content-Transfer-Encoding", "base64")
+	disp := "inline"
+	if a.Filename != "" {
+		disp = fmt.Sprintf("inline; filename=%q", a.Filename)
+	}
+	hdr.Set("Content-Disposition", disp)
+	if a.ContentID != "" {
+		hdr.Set("Content-Id", "<"+a.ContentID+">")
+	}
+	pw, err := w.CreatePart(hdr)
+	if err != nil {
+		return err
+	}
+	_, err = pw.Write(base64Lines(a.Content))
+	return err
+}
+
+// checkNoNewlines rejects CR/LF in anything that becomes a header value:
+// an attacker-supplied "\r\nBcc: victim@…" line is header injection (audit
+// item 9: in_reply_to and attachment content types reached the wire raw).
+func checkNoNewlines(v string) error {
+	if strings.ContainsAny(v, "\r\n") {
+		return fmt.Errorf("header value contains a line break (header injection rejected)")
+	}
+	return nil
+}
+
+// CountHeader counts occurrences of a header name in raw (case-insensitive).
+// More than one From/Subject/Date is an RFC 5322 violation and the known
+// signature-bypass trick (audit item 9: only the first From was authorized).
+func CountHeader(raw []byte, name string) int {
+	nameL := strings.ToLower(name)
+	n := 0
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if len(line) == 0 {
+			break // header block ended
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			continue // continuation
+		}
+		if i := bytes.IndexByte(line, ':'); i > 0 && strings.EqualFold(string(line[:i]), nameL) {
+			n++
+		}
+	}
+	return n
 }
 
 // headerOrder fixes the wire order of our own headers: deterministic output
@@ -514,9 +666,10 @@ func isAtext(r rune) bool {
 }
 
 // ValidAddress accepts exactly what we will put on the wire: a dot-atom local
-// part, a dotted domain or an address literal, 254 octets overall, local part
-// at most 64. Display names, folding whitespace and control characters are
-// rejected outright.
+// part and a dotted domain, 254 octets overall, local part at most 64.
+// Display names, folding whitespace and control characters are rejected
+// outright, and so are address literals (user@[10.0.0.1]) — they are an
+// outbound-SSRF door (audit item 10) and no legitimate customer uses them.
 func ValidAddress(s string) bool {
 	if len(s) > 254 {
 		return false
@@ -542,7 +695,7 @@ func ValidAddress(s string) bool {
 	}
 	domain := s[i+1:]
 	if strings.HasPrefix(domain, "[") {
-		return literalRe.MatchString(domain)
+		return false // no address literals on the outbound path (audit item 10)
 	}
 	labels := strings.Split(domain, ".")
 	top := len(labels) - 1

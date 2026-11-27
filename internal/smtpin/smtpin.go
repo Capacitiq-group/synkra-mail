@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	spf "blitiri.com.ar/go/spf"
@@ -62,9 +63,48 @@ func mustCert(cfg *config.Config) *tls.Certificate {
 	return &cert
 }
 
-func (s *Server) Serve(ln net.Listener) error { return s.srv.Serve(ln) }
-func (s *Server) ListenAndServe() error       { return s.srv.ListenAndServe() }
-func (s *Server) Close() error                { return s.srv.Close() }
+func (s *Server) Serve(ln net.Listener) error {
+	return s.srv.Serve(limitConns(ln, s.Cfg.MaxInboundConns))
+}
+func (s *Server) ListenAndServe() error { return s.srv.ListenAndServe() }
+func (s *Server) Close() error          { return s.srv.Close() }
+
+// limitConns caps concurrent inbound connections (audit item 29: the inbound
+// SMTP listener had no cap at all — a connection flood held one goroutine and
+// buffers each). In excess of the cap, connections queue in the accept
+// backlog instead of being served, which back-pressures the flood.
+func limitConns(ln net.Listener, max int) net.Listener {
+	if max <= 0 {
+		max = 256
+	}
+	return &cappedListener{Listener: ln, sem: make(chan struct{}, max)}
+}
+
+type cappedListener struct {
+	net.Listener
+	sem chan struct{}
+}
+
+func (c *cappedListener) Accept() (net.Conn, error) {
+	conn, err := c.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	c.sem <- struct{}{}
+	return &cappedConn{Conn: conn, release: func() { <-c.sem }}, nil
+}
+
+type cappedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *cappedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
 
 func remoteIP(c *gosmtp.Conn) net.IP {
 	if nc := c.Conn(); nc != nil {
@@ -179,104 +219,71 @@ func (s *Server) verifyAuth(ctx context.Context, raw []byte, ip net.IP, helo, en
 		}
 	}
 
-	// DKIM: verify any signatures.
+	// DKIM: verify any signatures; remember EVERY passing domain so DMARC can
+	// pick the aligned one (audit item 8).
 	if vs, err := dkim.Verify(bytes.NewReader(raw)); err == nil && len(vs) > 0 {
-		pass := false
+		var passing []string
 		for _, v := range vs {
 			if v.Err == nil {
-				pass = true
-				av.DKIMDomain = v.Domain
-				break
+				passing = append(passing, strings.ToLower(strings.TrimSuffix(v.Domain, ".")))
 			}
 		}
-		if pass {
+		if len(passing) > 0 {
 			av.DKIM = "pass"
+			av.DKIMDomain = passing[0]
+			av.DKIMPassDomains = passing
 		} else {
 			av.DKIM = "fail"
 		}
 	}
 
-	// DMARC: fetch policy for the From domain (our evaluation, library-free alignment v1).
-	fromDomain := fromDomainOf(raw)
+	// DMARC: rewritten evaluation (dmarc.go) — exact tag parsing, org-domain
+	// policy fallback, relaxed alignment, any aligned DKIM pass, and the From
+	// domain parsed by the standard address parser (audit item 8).
+	fromDomain := FromDomainOfHeader(rawHeaderValue(raw, "From"))
+	av.FromDomain = fromDomain
 	if fromDomain != "" {
-		pol := dmarcPolicyOf(ctx, fromDomain)
-		av.DMARCPolicy = pol
-		spAligned := av.SPF == "pass" && domainsAlign(spfDomain(envFrom), fromDomain)
-		dkAligned := av.DKIM == "pass" && domainsAlign(av.DKIMDomain, fromDomain)
-		if pol != "" {
-			if spAligned || dkAligned {
-				av.DMARC = "pass"
-			} else {
-				av.DMARC = "fail"
-			}
+		rec := lookupDMARCRecord(ctx, fromDomain)
+		av.DMARCRecord = rec
+		spfDom := ""
+		if av.SPF == "pass" {
+			spfDom = spfDomain(envFrom)
 		}
+		result, pol := EvaluateDMARC(fromDomain, rec, spfDom, av.DKIMPassDomains)
+		av.DMARC = result
+		av.DMARCPolicy = pol
 	}
 	return av
 }
 
-func fromDomainOf(raw []byte) string {
-	i := bytes.Index(raw, []byte("\r\n\r\n"))
-	head := raw
-	if i >= 0 {
-		head = raw[:i]
-	}
-	for _, line := range strings.Split(string(head), "\r\n") {
-		lower := strings.ToLower(line)
-		if strings.HasPrefix(lower, "from:") {
-			addr := strings.TrimSpace(strings.TrimPrefix(line[5:], ""))
-			if at := strings.LastIndex(addr, "@"); at >= 0 {
-				d := strings.TrimSuffix(addr[at+1:], ">")
-				return strings.ToLower(strings.TrimSpace(d))
-			}
+// rawHeaderValue extracts one header field's value from the wire form
+// (case-insensitive, folded continuation lines joined) — "" when absent.
+func rawHeaderValue(raw []byte, name string) string {
+	nameL := strings.ToLower(name)
+	var value string
+	var found bool
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if len(line) == 0 {
+			break // header block ended
 		}
-	}
-	return ""
-}
-
-func spfDomain(envFrom string) string {
-	if at := strings.LastIndex(envFrom, "@"); at >= 0 {
-		return strings.ToLower(envFrom[at+1:])
-	}
-	return strings.ToLower(envFrom)
-}
-
-func domainsAlign(a, b string) bool {
-	if a == "" || b == "" {
-		return false
-	}
-	a, b = strings.ToLower(a), strings.ToLower(b)
-	return a == b || strings.HasSuffix(a, "."+b) || strings.HasSuffix(b, "."+a)
-}
-
-func dmarcPolicyOf(ctx context.Context, domain string) string {
-	// Short timeout: a slow resolver must not stall the MX.
-	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	rec := lookupDMARC(qctx, domain)
-	return rec
-}
-
-func lookupDMARC(ctx context.Context, domain string) string {
-	resolver := &net.Resolver{}
-	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	txts, err := resolver.LookupTXT(qctx, "_dmarc."+domain)
-	if err != nil || len(txts) == 0 {
-		return ""
-	}
-	for _, t := range txts {
-		t = strings.ToLower(strings.TrimSpace(t))
-		if strings.HasPrefix(t, "v=dmarc1") {
-			if strings.Contains(t, "p=reject") {
-				return "reject"
+		if line[0] == ' ' || line[0] == '\t' {
+			if found {
+				value += " " + strings.TrimSpace(string(line))
 			}
-			if strings.Contains(t, "p=quarantine") {
-				return "quarantine"
-			}
-			return "none"
+			continue
 		}
+		i := bytes.IndexByte(line, ':')
+		if i <= 0 {
+			continue
+		}
+		if found || !strings.EqualFold(string(line[:i]), nameL) {
+			continue
+		}
+		found = true
+		value = strings.TrimSpace(string(line[i+1:]))
 	}
-	return ""
+	return value
 }
 
 // DeliverLoopback lives in ingest (DeliverInbound is there) — alias kept for callers.
@@ -313,6 +320,10 @@ func NewSubmission(cfg *config.Config, deps *ingest.Deps, auth *AuthAdapter) *Su
 	srv.MaxMessageBytes = cfg.MaxMessageBytes
 	srv.AllowInsecureAuth = cfg.Env != "prod" // dev plaintext for tests; prod requires TLS before AUTH
 	srv.EnableREQUIRETLS = false
+	// Submission read/write deadlines (audit item 29: none were set — a
+	// silent client held the session forever).
+	srv.ReadTimeout = 3 * time.Minute
+	srv.WriteTimeout = 3 * time.Minute
 	if cfg.TLSEnabled {
 		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*mustCert(cfg)}}
 	}
@@ -386,6 +397,12 @@ func (s *subSession) Rcpt(to string, opts *gosmtp.RcptOptions) error {
 	}
 	if len(s.rcpts) >= 50 {
 		return &gosmtp.SMTPError{Code: 452, Message: "4.5.3 too many recipients"}
+	}
+	// Validate here, not only in the pipeline (audit item 2): an
+	// unvalidated string went into `RCPT TO:<%s>` on the wire, and
+	// envelope-only (Bcc) recipients previously skipped validation entirely.
+	if !mimeutil.ValidAddress(to) {
+		return &gosmtp.SMTPError{Code: 501, Message: "5.1.3 bad recipient address syntax"}
 	}
 	s.rcpts = append(s.rcpts, to)
 	return nil

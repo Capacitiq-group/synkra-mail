@@ -1,13 +1,20 @@
 // Package config loads Synkra Email configuration from the environment.
 // Every knob has a dev-safe default; production values arrive via env on the VPS.
+// Fail-closed rule (2026-11-27 audit item 7): unknown SYNKRA_MAIL_ENV values are
+// refused, prod requires strong secrets, and the outbound transport never
+// silently falls back to loopback — it must be named.
 package config
 
 import (
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"synkra.email/mail/internal/krypto"
 )
 
 // Config is the full process configuration. `maild` and `tracker` both consume it.
@@ -49,6 +56,32 @@ type Config struct {
 
 	SubmissionTLSAddr string // implicit-TLS submission (465 prod). Empty = disabled (dev).
 
+	// OutboundTransport names the delivery transport explicitly (audit item 7):
+	// "auto" = smtp in prod, loopback in dev; "loopback" | "smtp" force it in
+	// any env. The worker logs which one is live at startup.
+	OutboundTransport string
+
+	// OutboundSourceIP binds outbound SMTP connections to this local address
+	// (audit item 20: the "additional sending IP" must actually be usable).
+	// Empty = default source.
+	OutboundSourceIP string
+
+	// TrustedProxy: when true, X-Forwarded-For is honoured for rate limiting
+	// (audit item 6: an untrusted XFF is a spray bypass). Dev default false.
+	TrustedProxy bool
+
+	// Secrets: at-rest encryption for DKIM private keys and TOTP seeds
+	// (audit item 4). Required in prod; base64, 32 bytes when raw.
+	KMSKey string
+
+	// Domain policy (audit item 11).
+	MaxDomainsPerOrg       int
+	UnverifiedDomainExpiry time.Duration // janitor releases unverified domains after this
+	ReverifyIntervalDays   int           // verified domains re-check ownership this often
+
+	// Inbound protection (audit item 5 / 29).
+	MaxInboundConns int // concurrent inbound SMTP connections (0 = 256 default)
+
 	// Limits (owner policy, Section 7.3).
 	Limits Limits
 
@@ -59,6 +92,7 @@ type Config struct {
 	Breaker Breaker
 
 	// Warmup: per-IP daily outbound cap during IP warmup (Section 8.3). 0 = uncapped.
+	// Counted across ALL orgs on the IP (audit item 20), not per org.
 	WarmupDailyCap int
 
 	// App password policy (owner decision): max 10 active, 180-day expiry.
@@ -72,14 +106,15 @@ type Config struct {
 	MaxMessageBytes int64
 
 	// Outbound worker tuning.
-	WorkerCount          int
-	WorkerPollInterval   time.Duration
-	JanitorInterval      time.Duration
+	WorkerCount               int
+	WorkerConcurrency         int // concurrent deliveries per worker (audit item 19: head-of-line blocking)
+	WorkerPollInterval        time.Duration
+	JanitorInterval           time.Duration
 	LoginAttemptRetentionDays int
 	RateEventRetentionDays    int
 	IdempotencyRetentionDays  int
-	BlobGCBatch          int
-	QueueEscapeHatchJobs int // Section 5.3: documented, not acted on at this scale
+	BlobGCBatch               int
+	QueueEscapeHatchJobs      int // Section 5.3: documented, not acted on at this scale
 }
 
 type HTTP struct {
@@ -89,6 +124,7 @@ type HTTP struct {
 	LoginMaxFails   int
 	LoginWindow     time.Duration
 	LoginLockoutDur time.Duration
+	LoginIPMaxFails int // per-IP spray gate within the window (audit item 6)
 	IMAPMaxConnUser int // per-user connection cap (Section 6.2)
 }
 
@@ -132,6 +168,10 @@ type Breaker struct {
 	MinAttempts       int // minimum attempts in window before the breaker can trip
 }
 
+// ErrProdConfig is returned with a precise message when prod startup would
+// run with an unsafe default (fail-closed, audit item 7).
+var ErrProdConfig = errors.New("unsafe production configuration")
+
 func Load() (*Config, error) {
 	c := &Config{
 		Env: envStr("SYNKRA_MAIL_ENV", "dev"),
@@ -166,6 +206,17 @@ func Load() (*Config, error) {
 		TLSKeyFile:        envStr("SYNKRA_MAIL_TLS_KEY", ""),
 		SubmissionTLSAddr: envStr("SYNKRA_MAIL_SUBMISSION_TLS_ADDR", ""),
 
+		OutboundTransport: envStr("SYNKRA_MAIL_OUTBOUND_TRANSPORT", "auto"),
+		OutboundSourceIP:  envStr("SYNKRA_MAIL_OUTBOUND_SOURCE_IP", ""),
+		TrustedProxy:      envStr("SYNKRA_MAIL_TRUSTED_PROXY", "") == "true",
+		KMSKey:            envStr("SYNKRA_MAIL_KMS_KEY", ""),
+
+		MaxDomainsPerOrg:       envInt("SYNKRA_MAIL_MAX_DOMAINS", 20),
+		UnverifiedDomainExpiry: envDur("SYNKRA_MAIL_UNVERIFIED_DOMAIN_EXPIRY", 30*24*time.Hour),
+		ReverifyIntervalDays:   envInt("SYNKRA_MAIL_REVERIFY_DAYS", 365),
+
+		MaxInboundConns: envInt("SYNKRA_MAIL_MAX_INBOUND_CONNS", 256),
+
 		Limits: Limits{
 			NewOrgDaily:          envInt("SYNKRA_MAIL_NEW_ORG_DAILY", 100),
 			NewMailboxHourly:     envInt("SYNKRA_MAIL_NEW_MAILBOX_HOURLY", 20),
@@ -199,14 +250,15 @@ func Load() (*Config, error) {
 
 		MaxMessageBytes: int64(envInt("SYNKRA_MAIL_MAX_MESSAGE_MB", 25)) * 1024 * 1024,
 
-		WorkerCount:          envInt("SYNKRA_MAIL_WORKERS", 4),
-		WorkerPollInterval:   envDur("SYNKRA_MAIL_WORKER_POLL", 2*time.Second),
+		WorkerCount:               envInt("SYNKRA_MAIL_WORKERS", 4),
+		WorkerConcurrency:         envInt("SYNKRA_MAIL_WORKER_CONCURRENCY", 8),
+		WorkerPollInterval:        envDur("SYNKRA_MAIL_WORKER_POLL", 2*time.Second),
 		JanitorInterval:           envDur("SYNKRA_MAIL_JANITOR_INTERVAL", time.Hour),
 		LoginAttemptRetentionDays: envInt("SYNKRA_MAIL_LOG_RETENTION_DAYS", 30),
 		RateEventRetentionDays:    envInt("SYNKRA_MAIL_RATE_RETENTION_DAYS", 90),
 		IdempotencyRetentionDays:  envInt("SYNKRA_MAIL_IDEMPOTENCY_RETENTION_DAYS", 7),
 		BlobGCBatch:               envInt("SYNKRA_MAIL_BLOB_GC_BATCH", 500),
-		QueueEscapeHatchJobs: 5000,
+		QueueEscapeHatchJobs:      5000,
 	}
 
 	c.HTTP = HTTP{
@@ -216,6 +268,7 @@ func Load() (*Config, error) {
 		LoginMaxFails:   envInt("SYNKRA_MAIL_LOGIN_MAX_FAILS", 10),
 		LoginWindow:     envDur("SYNKRA_MAIL_LOGIN_WINDOW", 10*time.Minute),
 		LoginLockoutDur: envDur("SYNKRA_MAIL_LOGIN_LOCKOUT", 15*time.Minute),
+		LoginIPMaxFails: envInt("SYNKRA_MAIL_LOGIN_IP_MAX_FAILS", 30),
 		IMAPMaxConnUser: envInt("SYNKRA_MAIL_IMAP_MAX_CONN", 8),
 	}
 
@@ -233,10 +286,25 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SYNKRA_MAIL_HOSTNAME must not be empty")
 	}
 
-	if c.TrackingSecret == "dev-tracking-secret" || c.HTTP.CookieSecret == "dev-cookie-secret" {
-		if c.Env == "prod" {
-			return nil, fmt.Errorf("SYNKRA_MAIL_TRACKING_SECRET and SYNKRA_MAIL_COOKIE_SECRET must be set in prod")
-		}
+	// Fail-closed environment (audit item 7): the exact strings "dev" and
+	// "prod" are the only valid values. Anything else — unset is fine (dev),
+	// a typo or a different spelling — is refused at startup rather than
+	// silently behaving like dev.
+	switch c.Env {
+	case "dev", "prod":
+	default:
+		return nil, fmt.Errorf("%w: SYNKRA_MAIL_ENV=%q is not one of dev|prod — refusing to guess", ErrProdConfig, c.Env)
+	}
+
+	if err := c.validateSecrets(); err != nil {
+		return nil, err
+	}
+
+	// Outbound transport must be named, never inferred from a mistyped env.
+	switch c.OutboundTransport {
+	case "auto", "loopback", "smtp":
+	default:
+		return nil, fmt.Errorf("%w: SYNKRA_MAIL_OUTBOUND_TRANSPORT=%q is not one of auto|loopback|smtp", ErrProdConfig, c.OutboundTransport)
 	}
 
 	if c.BlobMode == "s3" {
@@ -251,7 +319,99 @@ func Load() (*Config, error) {
 	if c.TLSCertFile != "" && c.TLSKeyFile != "" {
 		c.TLSEnabled = true
 	}
+	if err := c.validateProd(); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// validateSecrets enforces the secret-strength rule everywhere, not only in
+// prod (audit item 7: "no length or entropy check"). Minimum 32 characters,
+// never the shipped default, never a single repeated character.
+func (c *Config) validateSecrets() error {
+	for name, val := range map[string]string{
+		"SYNKRA_MAIL_TRACKING_SECRET": c.TrackingSecret,
+		"SYNKRA_MAIL_COOKIE_SECRET":   c.HTTP.CookieSecret,
+	} {
+		if err := checkSecret(name, val); err != nil {
+			if c.Env == "prod" {
+				return err
+			}
+			// Dev keeps running (tests need fixed secrets) but the value must
+			// still be one of the two shipped dev defaults, not a weak custom one.
+			if val != "dev-tracking-secret" && val != "dev-cookie-secret" {
+				fmt.Fprintf(os.Stderr, "[config] warning: %v\n", err)
+			}
+		}
+	}
+	return nil
+}
+
+func checkSecret(name, val string) error {
+	if val == "dev-tracking-secret" || val == "dev-cookie-secret" {
+		return fmt.Errorf("%w: %s must be changed from the shipped default", ErrProdConfig, name)
+	}
+	if len(val) < 32 {
+		return fmt.Errorf("%w: %s must be at least 32 characters (got %d)", ErrProdConfig, name, len(val))
+	}
+	first := val[0]
+	mono := true
+	for i := 1; i < len(val); i++ {
+		if val[i] != first {
+			mono = false
+			break
+		}
+	}
+	if mono {
+		return fmt.Errorf("%w: %s has no entropy (all characters identical)", ErrProdConfig, name)
+	}
+	return nil
+}
+
+// validateProd refuses to start prod with unsafe knobs: no encryption key, no
+// TLS, or a loopback outbound transport.
+func (c *Config) validateProd() error {
+	if c.Env != "prod" {
+		return nil
+	}
+	if c.KMSKey == "" {
+		return fmt.Errorf("%w: SYNKRA_MAIL_KMS_KEY is required in prod (DKIM keys and TOTP seeds are encrypted at rest)", ErrProdConfig)
+	}
+	if _, err := decodeKMSKey(c.KMSKey); err != nil {
+		return fmt.Errorf("SYNKRA_MAIL_KMS_KEY: %v", err)
+	}
+	if c.OutboundTransport == "loopback" {
+		return fmt.Errorf("%w: SYNKRA_MAIL_OUTBOUND_TRANSPORT=loopback would silently discard prod mail", ErrProdConfig)
+	}
+	if !c.TLSEnabled {
+		return fmt.Errorf("%w: SYNKRA_MAIL_TLS_CERT/SYNKRA_MAIL_TLS_KEY are required in prod (AUTH must never be offered in cleartext)", ErrProdConfig)
+	}
+	return nil
+}
+
+// decodeKMSKey accepts 32 raw bytes base64-encoded, or a passphrase of at
+// least 32 characters (SHA-256 derived, mirrored in krypto.DeriveKey).
+func decodeKMSKey(v string) ([]byte, error) {
+	if b, err := base64.StdEncoding.DecodeString(v); err == nil && len(b) == 32 {
+		return b, nil
+	}
+	if len(v) >= 32 {
+		return nil, nil // passphrase form — accepted, derived on use
+	}
+	return nil, fmt.Errorf("must be 32 base64-encoded bytes or a >=32 character passphrase")
+}
+
+// KMSKeyBytes materialises the at-rest encryption key (32 bytes). Raw base64
+// is used verbatim; a passphrase is SHA-256-derived. Dev without a key gets
+// the dev-derived default so tests run; prod refuses at Load().
+func (c *Config) KMSKeyBytes() []byte {
+	if c.KMSKey == "" {
+		return krypto.DeriveKey("synkra-dev-kms-key")
+	}
+	if b, err := base64.StdEncoding.DecodeString(c.KMSKey); err == nil && len(b) == 32 {
+		return b
+	}
+	return krypto.DeriveKey(c.KMSKey)
 }
 
 // DevDefaults returns a config suitable for tests: ephemeral-ish ports, fs blobs.

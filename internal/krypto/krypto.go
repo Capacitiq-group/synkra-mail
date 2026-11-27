@@ -1,17 +1,19 @@
-// Package krypto: password hashing (argon2id), token generation, and HMAC helpers.
-// Passwords live in mail.user / mail.app_password — never anywhere else (Section 7.1).
 package krypto
 
 import (
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base32"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -122,4 +124,108 @@ func Seal(key, plaintext []byte) ([]byte, error) {
 
 func Open(key, ciphertext []byte) ([]byte, error) {
 	return gcmOpen(key, ciphertext)
+}
+
+// DeriveKey turns a passphrase into a 32-byte AES key (SHA-256). Raw 32-byte
+// base64 keys are preferred; this keeps passphrase-form env values safe to use.
+func DeriveKey(passphrase string) []byte {
+	return deriveKey([]byte(passphrase))
+}
+
+// SealedString / OpenSealedString: the durable TEXT form of encrypted-at-rest
+// secrets (DKIM private keys, TOTP seeds). Format "enc1.<b64(nonce)>.<b64(ct)>"
+// so plaintext rows are recognisable and migratable. Fail-closed: an empty key
+// refuses to seal; a "enc1." row without a key refuses to open.
+const sealPrefix = "enc1."
+
+func SealedString(key []byte, plaintext string) (string, error) {
+	if len(key) == 0 {
+		return "", errors.New("refusing to seal: no key configured")
+	}
+	ct, err := gcmSeal(key, []byte(plaintext))
+	if err != nil {
+		return "", err
+	}
+	nonceLen := 12
+	if len(ct) < nonceLen {
+		return "", errors.New("seal: short ciphertext")
+	}
+	return sealPrefix + base64.RawStdEncoding.EncodeToString(ct), nil
+}
+
+func OpenSealedString(key []byte, sealed string) (string, error) {
+	if !strings.HasPrefix(sealed, sealPrefix) {
+		// Legacy plaintext row (pre-hardening dev data). Prod refuses.
+		return sealed, nil
+	}
+	if len(key) == 0 {
+		return "", errors.New("refusing to open sealed secret: no key configured")
+	}
+	ct, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(sealed, sealPrefix))
+	if err != nil {
+		return "", err
+	}
+	pt, err := gcmOpen(key, ct)
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
+}
+
+// ---- TOTP (RFC 6238, SHA-1, 6 digits, 30 s step — the authenticator-app
+// standard; implemented here so MFA has no new dependency) ----
+
+// NewTOTPSecret returns a base32 (RFC 4648, no padding) seed, 160 bits.
+func NewTOTPSecret() string {
+	b := make([]byte, 20)
+	rand.Read(b)
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)
+}
+
+// TOTPCode computes the 6-digit code for the 30-second step at t.
+func TOTPCode(secret string, t time.Time) (string, error) {
+	return totpCodeOffset(secret, t.Unix()/30)
+}
+
+// VerifyTOTP checks code against the current step and ±1 window (clock skew),
+// in constant time per comparison.
+func VerifyTOTP(secret, code string) bool {
+	step := time.Now().Unix() / 30
+	for _, off := range []int64{0, -1, 1} {
+		want, err := totpCodeOffset(secret, step+off)
+		if err != nil {
+			return false
+		}
+		if subtle.ConstantTimeCompare([]byte(want), []byte(code)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func totpCodeOffset(secret string, step int64) (string, error) {
+	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.ReplaceAll(secret, " ", "")))
+	if err != nil || len(key) == 0 {
+		return "", errors.New("bad totp secret")
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(step))
+	mac := hmac.New(sha1.New, key)
+	mac.Write(buf[:])
+	sum := mac.Sum(nil)
+	off := sum[len(sum)-1] & 0x0f
+	val := (binary.BigEndian.Uint32(sum[off:off+4]) & 0x7fffffff) % 1000000
+	return fmt.Sprintf("%06d", val), nil
+}
+
+// TOTPAuthURL renders the otpauth:// URI authenticator apps scan.
+func TOTPAuthURL(issuer, account, secret string) string {
+	q := urlQueryEscape("issuer") + "=" + urlQueryEscape(issuer) +
+		"&" + urlQueryEscape("secret") + "=" + urlQueryEscape(secret)
+	return "otpauth://totp/" + urlQueryEscape(issuer) + ":" + urlQueryEscape(account) + "?" + q
+}
+
+func urlQueryEscape(s string) string {
+	replacer := strings.NewReplacer("%", "%25", " ", "%20", ":", "%3A", "/", "%2F", "?", "%3F", "&", "%26", "=", "%3D", "#", "%23")
+	return replacer.Replace(s)
 }

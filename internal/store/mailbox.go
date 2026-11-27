@@ -101,11 +101,15 @@ func DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID) error {
 
 // ---- addresses (routable addresses; aliases are address rows, not mailboxes — Section 4.1) ----
 
-// reservedLocals: the RFC 2142 tier-0 role addresses (build register §1.5).
-// They stay platform-operated: no organisation may register them on the
-// platform domain, on any of its mail hosts or through the API.
+// reservedLocals: the RFC 2142 tier-0 role addresses plus the platform-machine
+// paths (audit item 12: a customer registering dmarc-reports@… must never be
+// able to intercept platform mail — DMARC reports, bounce handles, notifications).
 var reservedLocals = map[string]struct{}{
-	"postmaster": {}, "abuse": {}, "admin": {}, "hostmaster": {}, "webmaster": {}, "security": {},
+	"postmaster": {}, "abuse": {}, "admin": {}, "administrator": {},
+	"hostmaster": {}, "webmaster": {}, "security": {},
+	"dmarc": {}, "dmarc-reports": {}, "dmarc-report": {},
+	"noreply": {}, "no-reply": {}, "donotreply": {}, "mailer-daemon": {},
+	"root": {}, "support": {}, "help": {}, "billing": {}, "notifications": {},
 }
 
 // ErrReservedLocal is returned when an address claims one of those local parts
@@ -264,15 +268,35 @@ func MailboxAccess(ctx context.Context, q Querier, userID, mailboxID uuid.UUID) 
 	return n > 0, err
 }
 
+// MailboxAccessWrite: can the user change things in this mailbox (flags, move,
+// delete, folder create/delete)? Owners and members can; viewers are read-only
+// (audit item 14: a viewer could write because every write-down only checked
+// MailboxAccess, which accepts any membership role).
+func MailboxAccessWrite(ctx context.Context, q Querier, userID, mailboxID uuid.UUID) (bool, error) {
+	var n int
+	err := q.QueryRow(ctx, `
+                select count(*) from mail.mailbox mb
+                where mb.id=$2 and (mb.owner_user_id=$1
+                  or exists (select 1 from mail.mailbox_member mm
+                             where mm.mailbox_id=mb.id and mm.user_id=$1 and mm.role in ('owner','member')))`,
+		userID, mailboxID).Scan(&n)
+	return n > 0, err
+}
+
 // MailboxMemberRole returns the user's role on a mailbox ("" when none).
+// The previous version passed two bind parameters to a query that referenced
+// neither correctly and was never called; fixed and now used by the write gate.
 func MailboxMemberRole(ctx context.Context, q Querier, userID, mailboxID uuid.UUID) (string, error) {
 	var role string
 	var ownerID *uuid.UUID
-	err := q.QueryRow(ctx, `select owner_user_id from mail.mailbox where id=$2`, userID, mailboxID).Scan(&ownerID)
+	err := q.QueryRow(ctx, `select owner_user_id from mail.mailbox where id=$1`, mailboxID).Scan(&ownerID)
 	if err == nil && ownerID != nil && *ownerID == userID {
 		return "owner", nil
 	}
-	err = q.QueryRow(ctx, `select role from mail.mailbox_member where mailbox_id=$2 and user_id=$1`, userID, mailboxID).Scan(&role)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	err = q.QueryRow(ctx, `select role from mail.mailbox_member where mailbox_id=$1 and user_id=$2`, mailboxID, userID).Scan(&role)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -374,7 +398,7 @@ type MemberView struct {
 // admin surface reads through this.
 func ListMembers(ctx context.Context, q Querier, mailboxID uuid.UUID) ([]MemberView, error) {
 	rows, err := q.Query(ctx, `select mm.id, mm.mailbox_id, mm.user_id, mm.role, mm.created_at,
-		u.id, u.org_id, u.email::text, '', (u.totp_secret_enc is not null), u.display_name, u.role, u.is_platform_admin, u.status, u.created_at, u.updated_at
+		u.id, u.org_id, u.email::text, '', (u.totp_secret_enc is not null), u.totp_enabled, u.email_verified_at, u.display_name, u.role, u.is_platform_admin, u.status, u.created_at, u.updated_at
 		from mail.mailbox_member mm join mail.user u on u.id = mm.user_id
 		where mm.mailbox_id=$1 order by mm.created_at`, mailboxID)
 	if err != nil {
@@ -385,7 +409,7 @@ func ListMembers(ctx context.Context, q Querier, mailboxID uuid.UUID) ([]MemberV
 	for rows.Next() {
 		var v MemberView
 		if err := rows.Scan(&v.Member.ID, &v.Member.MailboxID, &v.Member.UserID, &v.Member.Role, &v.Member.CreatedAt,
-			&v.User.ID, &v.User.OrgID, &v.User.Email, &v.User.PasswordHash, &v.User.HasTOTP, &v.User.DisplayName,
+			&v.User.ID, &v.User.OrgID, &v.User.Email, &v.User.PasswordHash, &v.User.HasTOTP, &v.User.TotpEnabled, &v.User.EmailVerifiedAt, &v.User.DisplayName,
 			&v.User.Role, &v.User.IsPlatformAdmin, &v.User.Status, &v.User.CreatedAt, &v.User.UpdatedAt); err != nil {
 			return nil, err
 		}

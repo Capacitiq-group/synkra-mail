@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"synkra.email/mail/internal/model"
 )
@@ -76,22 +78,38 @@ func ClaimDueJobs(ctx context.Context, q Querier, workerID string, lease time.Du
 	return out, rows.Err()
 }
 
+// ErrLeaseLost means the job was reclaimed by another worker between claim and
+// completion: the current result must be discarded, never written (audit item
+// 17 — the tail of a slow batch expired and both workers delivered).
+var ErrLeaseLost = errors.New("delivery job lease lost")
+
 func MarkJobDelivered(ctx context.Context, tx pgx.Tx, id uuid.UUID, code, msg string) error {
-	_, err := tx.Exec(ctx, `update mail.delivery_job set status='delivered', last_code=$2, last_msg=$3,
-		lease_until=null, updated_at=now() where id=$1`, id, code, msg)
-	return err
+	ct, err := tx.Exec(ctx, `update mail.delivery_job set status='delivered', last_code=$2, last_msg=$3,
+		lease_until=null, updated_at=now() where id=$1 and status='in_flight'`, id, code, msg)
+	return leaseCheck(ct, err)
 }
 
 func DeferJob(ctx context.Context, tx pgx.Tx, id uuid.UUID, attempts int, nextAt time.Time, code, msg string) error {
-	_, err := tx.Exec(ctx, `update mail.delivery_job set status='deferred', attempts=$2, next_attempt_at=$3,
-		last_code=$4, last_msg=$5, lease_until=null, updated_at=now() where id=$1`, id, attempts, nextAt, code, msg)
-	return err
+	ct, err := tx.Exec(ctx, `update mail.delivery_job set status='deferred', attempts=$2, next_attempt_at=$3,
+		last_code=$4, last_msg=$5, lease_until=null, updated_at=now() where id=$1 and status='in_flight'`, id, attempts, nextAt, code, msg)
+	return leaseCheck(ct, err)
 }
 
 func BounceJob(ctx context.Context, tx pgx.Tx, id uuid.UUID, attempts int, code, msg string) error {
-	_, err := tx.Exec(ctx, `update mail.delivery_job set status='bounced', attempts=$2, last_code=$3, last_msg=$4,
-		lease_until=null, updated_at=now() where id=$1`, id, attempts, code, msg)
-	return err
+	ct, err := tx.Exec(ctx, `update mail.delivery_job set status='bounced', attempts=$2, last_code=$3, last_msg=$4,
+		lease_until=null, updated_at=now() where id=$1 and status='in_flight'`, id, attempts, code, msg)
+	return leaseCheck(ct, err)
+}
+
+// leaseCheck converts a zero-row guarded update into ErrLeaseLost.
+func leaseCheck(ct pgconn.CommandTag, err error) error {
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 func RecordDSN(ctx context.Context, tx pgx.Tx, d *model.DSN) error {
@@ -132,8 +150,21 @@ func QueueDepth(ctx context.Context, q Querier) (int, error) {
 
 func Suppress(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, email, reason string) error {
 	_, err := tx.Exec(ctx, `insert into mail.suppression (org_id, email, reason) values ($1,$2,$3)
-		on conflict (org_id, email) do nothing`, orgID, email, reason)
+		on conflict (org_id, email) do update set reason=excluded.reason`, orgID, email, reason)
 	return err
+}
+
+// DeleteSuppression: the owner-facing removal (audit item 18 — the list had no
+// management surface at all; a corrected address could never be re-enabled).
+func DeleteSuppression(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, email string) error {
+	ct, err := tx.Exec(ctx, `delete from mail.suppression where org_id=$1 and email=$2`, orgID, email)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func IsSuppressed(ctx context.Context, q Querier, orgID uuid.UUID, email string) (bool, error) {
@@ -236,6 +267,46 @@ func ListSuppressionAll(ctx context.Context, q Querier, limit int) ([]model.Supp
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// ---- atomic send-limit counters (audit item 20: the COUNT-then-send checks
+// raced, so concurrent submissions could overshoot every cap) ----
+
+// ReserveSend atomically reserves n sends against a counter key
+// ("org:<uuid>:<yyyymmdd>" or "mb:<uuid>:<yyyymmddhh>") and returns false when
+// the cap is already exhausted. One statement — no read-modify-write race.
+func ReserveSend(ctx context.Context, q Querier, counterKey string, n, cap int) (bool, error) {
+	var used int
+	err := q.QueryRow(ctx, `
+		insert into mail.send_counter (counter_key, used) values ($1, $2)
+		on conflict (counter_key) do update set used = send_counter.used + $2, updated_at = now()
+		where send_counter.used + $2 <= $3
+		returning used`, counterKey, n, cap).Scan(&used)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// PruneSendCounters drops counter rows older than the retention window.
+func PruneSendCounters(ctx context.Context, q Querier, olderThan time.Time) (int64, error) {
+	ct, err := q.Exec(ctx, `delete from mail.send_counter where updated_at < $1`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+// WarmupSendTotal counts today's sends across ALL orgs (audit item 20: the
+// warmup cap was per-org, so N tenants each got the whole IP budget).
+func WarmupSendTotal(ctx context.Context, q Querier, dayStart time.Time) (int, error) {
+	var n int
+	err := q.QueryRow(ctx, `select coalesce(sum(used),0) from mail.send_counter
+		where counter_key like 'org:%' and updated_at > $1`, dayStart).Scan(&n)
+	return n, err
 }
 
 // RecordDeliveryEvent appends one state-machine row (register §7.3: the most

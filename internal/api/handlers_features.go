@@ -112,11 +112,11 @@ func (s *Server) handleGetAutoresponder(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":   ar.Enabled,
-		"subject":   ar.Subject,
-		"body":      ar.Body,
-		"starts_at": ar.StartsAt,
-		"ends_at":   ar.EndsAt,
+		"enabled":    ar.Enabled,
+		"subject":    ar.Subject,
+		"body":       ar.Body,
+		"starts_at":  ar.StartsAt,
+		"ends_at":    ar.EndsAt,
 		"updated_at": ar.UpdatedAt,
 	})
 }
@@ -245,7 +245,7 @@ func (s *Server) handleCreateRule(w http.ResponseWriter, r *http.Request) {
 	}
 	rule := &store.MailboxRule{
 		ID: uuid.New(), MailboxID: mbID,
-		Enabled: req.Enabled == nil || *req.Enabled,
+		Enabled:   req.Enabled == nil || *req.Enabled,
 		MatchFrom: req.MatchFrom, MatchSubject: req.MatchSubject,
 		ActionMarkRead: req.ActionMarkRead,
 	}

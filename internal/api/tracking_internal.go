@@ -21,9 +21,9 @@ import (
 )
 
 type internalEventReq struct {
-		OrgID      string    `json:"org_id,omitempty"`
-		MailboxID  string    `json:"mailbox_id,omitempty"`
-		Rcpt       string    `json:"rcpt,omitempty"`
+	OrgID        string    `json:"org_id,omitempty"`
+	MailboxID    string    `json:"mailbox_id,omitempty"`
+	Rcpt         string    `json:"rcpt,omitempty"`
 	Kind         string    `json:"kind"` // open | click | unsubscribe
 	ID           string    `json:"id"`   // pixel id or link id
 	OccurredAt   time.Time `json:"occurred_at"`
@@ -33,10 +33,13 @@ type internalEventReq struct {
 }
 
 // handleInternalTrackingEvent consumes verified tracker events.
+// Order matters (audit item 5): the body is size-capped FIRST, and the HMAC
+// is verified BEFORE anything else — the old code read an unbounded body and
+// even ran it through json.Unmarshal before checking the signature.
 func (s *Server) handleInternalTrackingEvent(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10)) // 64 KiB: events are small JSON
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "unreadable body")
+		writeError(w, http.StatusBadRequest, "invalid_request", "unreadable body")
 		return
 	}
 	// HMAC service authentication (tracker ↔ core share a secret).

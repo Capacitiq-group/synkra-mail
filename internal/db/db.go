@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +20,15 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
+	// The pool is shared by API handlers, SMTP sessions, workers and the
+	// janitor; the 20-connection ceiling is now tunable for the VPS size
+	// (audit item 29).
 	cfg.MaxConns = 20
+	if v := os.Getenv("SYNKRA_MAIL_DB_MAX_CONNS"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil && n >= 4 {
+			cfg.MaxConns = int32(n)
+		}
+	}
 	cfg.MinConns = 2
 	cfg.MaxConnLifetime = time.Hour
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -32,9 +41,30 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// Migrate applies every *.sql in dir in lexical order, once each, inside a transaction.
+// migrationLockKey is the advisory-lock id that serialises migrations across
+// split-role start-ups (audit item 29: the api and worker processes racing to
+// migrate the same database interleaved their DDL).
+const migrationLockKey = 's'<<24 | 'y'<<16 | 'n'<<8 | 'k' // "synk"
+
+// Migrate applies every *.sql in dir in lexical order, once each, inside a transaction,
+// under a session-scoped advisory lock.
 func Migrate(ctx context.Context, pool *pgxpool.Pool, dir string) error {
-	if _, err := pool.Exec(ctx, `
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire for migration lock: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `select pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return fmt.Errorf("migration advisory lock: %w", err)
+	}
+	// Unlock on a detached context: a cancelled migration context must not
+	// leak the session lock (it dies with the connection anyway, but the
+	// explicit unlock keeps split-role restarts clean).
+	unlockCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	defer conn.Exec(unlockCtx, `select pg_advisory_unlock($1)`, migrationLockKey)
+
+	if _, err := conn.Exec(ctx, `
 		create table if not exists schema_migrations (
 			version text primary key,
 			applied_at timestamptz not null default now()

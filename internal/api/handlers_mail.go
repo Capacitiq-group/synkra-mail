@@ -30,6 +30,7 @@ import (
 type loginReq struct {
 	Email     string `json:"email"`
 	Password  string `json:"password"`
+	TOTPCode  string `json:"totp_code"`
 	UserAgent string `json:"-"`
 }
 
@@ -43,7 +44,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_credentials", "email and password required")
 		return
 	}
-	ac, token, err := s.Auth.Login(r.Context(), req.Email, req.Password, remoteIP(r), r.UserAgent())
+	ac, token, err := s.Auth.Login(r.Context(), req.Email, req.Password, s.remoteIP(r), r.UserAgent(), strings.TrimSpace(req.TOTPCode))
 	if err != nil {
 		mapError(w, err)
 		return
@@ -77,9 +78,15 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-func remoteIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.Split(fwd, ",")[0]
+func (s *Server) remoteIP(r *http.Request) string {
+	// X-Forwarded-For is trusted only when the deployment says a proxy is in
+	// front (audit item 6: an untrusted XFF made the throttle both a lockout
+	// weapon and a spray bypass). The RealIP middleware is likewise gated in
+	// cmd/maild.
+	if s.Cfg != nil && s.Cfg.TrustedProxy {
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			return strings.TrimSpace(strings.Split(fwd, ",")[0])
+		}
 	}
 	host := r.RemoteAddr
 	if i := strings.LastIndex(host, ":"); i > 0 {
@@ -186,8 +193,8 @@ func (s *Server) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "bad mailbox_id")
 		return
 	}
-	if acc, err := store.MailboxAccess(r.Context(), s.Store.Pool, ac.User.ID, mbID); err != nil || !acc {
-		writeError(w, http.StatusForbidden, "forbidden", "no access to mailbox")
+	if acc, err := store.MailboxAccessWrite(r.Context(), s.Store.Pool, ac.User.ID, mbID); err != nil || !acc {
+		writeError(w, http.StatusForbidden, "forbidden", "write access to mailbox required")
 		return
 	}
 	f := &model.Folder{ID: uuid.New(), MailboxID: mbID, Name: req.Name}
@@ -213,8 +220,8 @@ func (s *Server) handleDeleteFolder(w http.ResponseWriter, r *http.Request) {
 		mapError(w, err)
 		return
 	}
-	if acc, aerr := store.MailboxAccess(r.Context(), s.Store.Pool, ac.User.ID, folder.MailboxID); aerr != nil || !acc {
-		writeError(w, http.StatusForbidden, "forbidden", "no access")
+	if acc, aerr := store.MailboxAccessWrite(r.Context(), s.Store.Pool, ac.User.ID, folder.MailboxID); aerr != nil || !acc {
+		writeError(w, http.StatusForbidden, "forbidden", "write access required (viewers are read-only)")
 		return
 	}
 	err = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
@@ -271,6 +278,12 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		mapError(w, err)
 		return
 	}
+	// A listing shows subjects and snippets: audited under impersonation,
+	// fail-closed (audit item 3).
+	if aerr := s.auditImpersonatedRead(r.Context(), ac, "message.list", "folder", folderID.String()); aerr != nil {
+		mapError(w, aerr)
+		return
+	}
 	out := map[string]any{
 		"folder":   folderViews([]model.Folder{*folder})[0],
 		"items":    itemViewList(items),
@@ -281,6 +294,18 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		out["next_before_uid"] = items[0].Item.UID // smallest uid of the page
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// auditImpersonatedRead: EVERY mail-content read under impersonation is
+// audited, and a failed audit write aborts the read (audit item 3).
+func (s *Server) auditImpersonatedRead(ctx context.Context, ac *authn.AuthContext, action, targetType, targetID string) error {
+	if !ac.Impersonating() {
+		return nil
+	}
+	return s.Store.WithTx(ctx, func(tx store.Tx) error {
+		adminID := ac.Session.ImpersonatedBy
+		return store.RecordAudit(ctx, tx, &ac.User.ID, adminID, true, action, targetType, targetID, "", nil)
+	})
 }
 
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
@@ -299,13 +324,12 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "no access")
 		return
 	}
-	// Mail-body access during impersonation is audited separately (Section 11.2).
-	if ac.Impersonating() {
-		_ = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
-			adminID := ac.Session.ImpersonatedBy
-			return store.RecordAudit(r.Context(), tx, &ac.User.ID, adminID, true,
-				"message.read", "message", id.String(), "", nil)
-		})
+	// Mail-body access during impersonation is audited — and the audit write
+	// is fail-closed (audit item 3: only this route was audited, and a failed
+	// write didn't stop the read).
+	if aerr := s.auditImpersonatedRead(r.Context(), ac, "message.read", "message", id.String()); aerr != nil {
+		mapError(w, aerr)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"message": messageView(&full.Message),
@@ -328,6 +352,10 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 	}
 	if acc, aerr := store.MailboxAccess(r.Context(), s.Store.Pool, ac.User.ID, full.Message.MailboxID); aerr != nil || !acc {
 		writeError(w, http.StatusForbidden, "forbidden", "no access")
+		return
+	}
+	if aerr := s.auditImpersonatedRead(r.Context(), ac, "message.read_raw", "message", id.String()); aerr != nil {
+		mapError(w, aerr)
 		return
 	}
 	rc, err := s.Pipeline.Blobs.Open(r.Context(), full.Message.BlobSHA256)
@@ -362,8 +390,10 @@ func (s *Server) handleSetFlags(w http.ResponseWriter, r *http.Request) {
 		mapError(w, err)
 		return
 	}
-	if acc, aerr := store.MailboxAccess(r.Context(), s.Store.Pool, ac.User.ID, full.Message.MailboxID); aerr != nil || !acc {
-		writeError(w, http.StatusForbidden, "forbidden", "no access")
+	// Write-down gate (audit item 14): flags/move/delete need member+ —
+	// MailboxAccess accepted viewer memberships, so a viewer could write.
+	if acc, aerr := store.MailboxAccessWrite(r.Context(), s.Store.Pool, ac.User.ID, full.Message.MailboxID); aerr != nil || !acc {
+		writeError(w, http.StatusForbidden, "forbidden", "write access required (viewers are read-only)")
 		return
 	}
 	if full.Item.ID == uuid.Nil {
@@ -404,8 +434,8 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 		mapError(w, err)
 		return
 	}
-	if acc, aerr := store.MailboxAccess(r.Context(), s.Store.Pool, ac.User.ID, full.Message.MailboxID); aerr != nil || !acc {
-		writeError(w, http.StatusForbidden, "forbidden", "no access")
+	if acc, aerr := store.MailboxAccessWrite(r.Context(), s.Store.Pool, ac.User.ID, full.Message.MailboxID); aerr != nil || !acc {
+		writeError(w, http.StatusForbidden, "forbidden", "write access required (viewers are read-only)")
 		return
 	}
 	dest, err := store.GetFolder(r.Context(), s.Store.Pool, destID)
@@ -442,8 +472,8 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 		mapError(w, err)
 		return
 	}
-	if acc, aerr := store.MailboxAccess(r.Context(), s.Store.Pool, ac.User.ID, full.Message.MailboxID); aerr != nil || !acc {
-		writeError(w, http.StatusForbidden, "forbidden", "no access")
+	if acc, aerr := store.MailboxAccessWrite(r.Context(), s.Store.Pool, ac.User.ID, full.Message.MailboxID); aerr != nil || !acc {
+		writeError(w, http.StatusForbidden, "forbidden", "write access required (viewers are read-only)")
 		return
 	}
 	if full.Item.ID == uuid.Nil {
@@ -454,8 +484,12 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	// Trash semantics (Section 4.4): first delete → Trash; delete in Trash → expunge.
 	var err2 error
 	if full.Folder.SpecialUse == model.FolderTrash {
+		// Expunge WITHOUT demanding \Deleted — the API never sets that flag,
+		// so this path 404'd forever (audit item 25). The message row and its
+		// children (attachments, jobs, tracking) purge together, releasing
+		// blob refs.
 		err2 = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
-			_, err := store.ExpungeItem(r.Context(), tx, full.Item.FolderID, full.Item.UID)
+			_, err := store.ExpungeItemNow(r.Context(), tx, full.Item.FolderID, full.Item.UID)
 			return err
 		})
 	} else {
@@ -605,6 +639,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		all = append(all, items...)
 	}
+	// Search results carry snippets: audited under impersonation (audit item 3).
+	if aerr := s.auditImpersonatedRead(r.Context(), ac, "message.search", "user", ac.User.ID.String()); aerr != nil {
+		mapError(w, aerr)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": itemViewList(all)})
 }
 
@@ -643,6 +682,10 @@ func (s *Server) handleMessageTracking(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "no access")
 		return
 	}
+	if aerr := s.auditImpersonatedRead(r.Context(), ac, "message.tracking", "message", id.String()); aerr != nil {
+		mapError(w, aerr)
+		return
+	}
 	v, err := store.TrackingEventsForMessage(r.Context(), s.Store.Pool, id)
 	if err != nil {
 		mapError(w, err)
@@ -676,6 +719,21 @@ func (s *Server) threadActorCanAccess(ctx context.Context, ac *authn.AuthContext
 	return false, nil
 }
 
+// threadActorCanWrite: notes and assignment are writes on the thread's
+// mailboxes — viewer memberships stay read-only (audit item 16).
+func (s *Server) threadActorCanWrite(ctx context.Context, ac *authn.AuthContext, threadID uuid.UUID) (bool, error) {
+	mbs, err := store.ThreadMailboxIDs(ctx, s.Store.Pool, threadID)
+	if err != nil {
+		return false, err
+	}
+	for _, mbID := range mbs {
+		if acc, aerr := store.MailboxAccessWrite(ctx, s.Store.Pool, ac.User.ID, mbID); aerr == nil && acc {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Server) handleThreadNote(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
 	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Thread)
@@ -690,13 +748,13 @@ func (s *Server) handleThreadNote(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
 		return
 	}
-	acc, err := s.threadActorCanAccess(r.Context(), ac, id)
+	acc, err := s.threadActorCanWrite(r.Context(), ac, id)
 	if err != nil {
 		mapError(w, err)
 		return
 	}
 	if !acc {
-		writeError(w, http.StatusForbidden, "forbidden", "no access to this thread's mailbox")
+		writeError(w, http.StatusForbidden, "forbidden", "write access to this thread's mailbox required (viewers are read-only)")
 		return
 	}
 	// Internal notes are never transmitted — they live on the thread row only.
@@ -731,16 +789,18 @@ func (s *Server) handleThreadAssign(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "bad assignee_id")
 		return
 	}
-	acc, err := s.threadActorCanAccess(r.Context(), ac, id)
+	acc, err := s.threadActorCanWrite(r.Context(), ac, id)
 	if err != nil {
 		mapError(w, err)
 		return
 	}
 	if !acc {
-		writeError(w, http.StatusForbidden, "forbidden", "no access to this thread's mailbox")
+		writeError(w, http.StatusForbidden, "forbidden", "write access to this thread's mailbox required (viewers are read-only)")
 		return
 	}
-	// The assignee must be able to see the thread too (register §1.4).
+	// The assignee must be able to see the thread too (register §1.4), and the
+	// thread's mailboxes pin the org — an out-of-org assignee can never have
+	// mailbox access, which closes the cross-org assignment hole (audit item 16).
 	if req.AssigneeID != "" {
 		mbs, merr := store.ThreadMailboxIDs(r.Context(), s.Store.Pool, id)
 		if merr != nil {
@@ -835,16 +895,31 @@ func (s *Server) handleCreateAddress(w http.ResponseWriter, r *http.Request) {
 	if req.Kind == "" {
 		req.Kind = "alias"
 	}
-	// Plan limits (aliases are address rows, Section 4.1).
+	if req.Kind != "alias" && req.Kind != "forward" && req.Kind != "user" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "kind must be alias, forward or user")
+		return
+	}
+	// Plan limits: aliases AND forwards both consume address rows and both
+	// are routing features — counting only kind=="alias" let forwards bypass
+	// the cap entirely (audit item 15).
 	plan, err := store.GetPlanByID(r.Context(), s.Store.Pool, ac.Org.PlanID)
 	if err != nil {
 		mapError(w, err)
 		return
 	}
-	if req.Kind == "alias" {
-		n, _ := store.CountAddressesByOrg(r.Context(), s.Store.Pool, ac.User.OrgID, "alias")
-		if n >= plan.AliasLimit {
-			writeError(w, http.StatusBadRequest, "limit_exceeded", "alias limit reached")
+	if req.Kind == "alias" || req.Kind == "forward" {
+		na, _ := store.CountAddressesByOrg(r.Context(), s.Store.Pool, ac.User.OrgID, "alias")
+		nf, _ := store.CountAddressesByOrg(r.Context(), s.Store.Pool, ac.User.OrgID, "forward")
+		if na+nf >= plan.AliasLimit {
+			writeError(w, http.StatusBadRequest, "limit_exceeded", "alias/forward limit reached")
+			return
+		}
+	}
+	if req.Kind == "forward" && req.ForwardTarget != "" {
+		if !mimeutil.ValidAddress(req.ForwardTarget) {
+			// An unvalidated forward target is an open-forwarder door
+			// (audit item 15).
+			writeError(w, http.StatusBadRequest, "invalid_address", "forward_target must be a valid address")
 			return
 		}
 	}
@@ -923,6 +998,12 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	ac := authFrom(r.Context())
+	// Registration is an org-admin action (audit item 11: any member could
+	// mint an RSA key per request — a CPU/pool DoS), with a per-org cap.
+	if ac.User.Role != "owner" && ac.User.Role != "admin" {
+		writeError(w, http.StatusForbidden, "forbidden", "org admin only")
+		return
+	}
 	body, err := readBody(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
@@ -931,8 +1012,14 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(body, &req); err != nil || !strings.Contains(req.Name, ".") {
-		writeError(w, http.StatusBadRequest, "invalid_request", "valid domain name required")
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "bad body")
+		return
+	}
+	req.Name = strings.ToLower(strings.TrimSpace(req.Name))
+	if !store.ValidDomainName(req.Name) {
+		writeErrorHint(w, http.StatusBadRequest, "invalid_request", "valid domain name required",
+			"a registrable FQDN: lowercase labels 1-63 octets, hyphens not leading/trailing, a lettered TLD")
 		return
 	}
 	key := r.Header.Get("Idempotency-Key")
@@ -943,7 +1030,24 @@ func (s *Server) handleCreateDomain(w http.ResponseWriter, r *http.Request) {
 		s.replayJSON(w, status, resp)
 		return
 	}
-	d := &model.Domain{ID: uuid.New(), OrgID: &ac.User.OrgID, Name: strings.ToLower(strings.TrimSpace(req.Name)), Status: "pending"}
+	if n, _ := store.CountDomainsByOrg(r.Context(), s.Store.Pool, ac.User.OrgID); n >= s.Cfg.MaxDomainsPerOrg {
+		writeError(w, http.StatusBadRequest, "limit_exceeded", "domain limit reached for this organisation")
+		return
+	}
+	// Key generation happens HERE — outside the database transaction (audit
+	// item 11) — and the private key is sealed before it is stored (audit item 4).
+	privPEM, pubTXT, selector, kerr := store.GenerateDKIMKeyPair()
+	if kerr != nil {
+		mapError(w, kerr)
+		return
+	}
+	sealed, serr := sealPrivatePEM(s, privPEM)
+	if serr != nil {
+		mapError(w, serr)
+		return
+	}
+	d := &model.Domain{ID: uuid.New(), OrgID: &ac.User.OrgID, Name: req.Name, Status: "pending",
+		DKIMSelector: selector, DKIMPrivatePEM: sealed, DKIMPublicTXT: pubTXT}
 	err = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
 		return store.CreateDomain(r.Context(), tx, d)
 	})
@@ -1034,12 +1138,25 @@ func (s *Server) handleDomainDNS(w http.ResponseWriter, r *http.Request) {
 		"domain": dom.Name,
 		"records": []map[string]string{
 			{"type": "MX", "name": "@", "value": "10 " + s.Cfg.Hostname, "purpose": "receive"},
-			{"type": "TXT", "name": "@", "value": "v=spf1 include:spf." + s.Cfg.PlatformDomain + " ~all", "purpose": "SPF"},
+			// SPF: merge the include into any EXISTING record — a second
+			// v=spf1 TXT is a permerror (audit item 22).
+			{"type": "TXT", "name": "@",
+				"value":   "v=spf1 include:spf." + s.Cfg.PlatformDomain + " ~all",
+				"purpose": "SPF — merge include:spf." + s.Cfg.PlatformDomain + " into your existing v=spf1 record; never publish a second v=spf1 record"},
 			{"type": "TXT", "name": dom.DKIMSelector + "._domainkey", "value": dom.DKIMPublicTXT, "purpose": "DKIM"},
-			{"type": "TXT", "name": "_dmarc", "value": "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@" + s.Cfg.PlatformDomain, "purpose": "DMARC"},
-			// RFC 7489 7.1: reports to an external receiver must be authorised
-			// by this record in the customer's zone, or every report is dropped.
-			{"type": "TXT", "name": s.Cfg.PlatformDomain + "._domainkey", "value": "v=DMARC1", "purpose": "DMARC report authorisation"},
+			// DMARC: reports flow to the platform collector, which is an
+			// EXTERNAL DESTINATION relative to the customer's domain. The
+			// authorisation record is therefore OURS to publish, not theirs:
+			// per RFC 7489 §7.1 the platform publishes
+			//   <customer-domain>._report._dmarc.<platform-domain> TXT "v=DMARC1"
+			// in the PLATFORM zone (done automatically by the DNS service when
+			// the domain is verified). The customer publishes only the _dmarc
+			// policy record below (audit item 22: the old instruction told the
+			// customer to add synkra.email._domainkey to their own zone — wrong
+			// name, wrong zone, wrong record type).
+			{"type": "TXT", "name": "_dmarc",
+				"value":   "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@" + s.Cfg.PlatformDomain,
+				"purpose": "DMARC policy — report address is authorised by the platform automatically; nothing to publish for it"},
 			{"type": "TXT", "name": "@", "value": dom.OwnershipToken, "purpose": "ownership verification"},
 		},
 	})

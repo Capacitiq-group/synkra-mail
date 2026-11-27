@@ -27,23 +27,28 @@ const (
 )
 
 type Deps struct {
-	Store    *store.Store
+	Store *store.Store
 	// AutoReply sends the mailbox's autoresponder message (register §12c).
 	// Wired to the outbound pipeline; ingest decides WHEN, not HOW.
 	AutoReply func(ctx context.Context, mailboxID, orgID uuid.UUID, to, inSubject string) error
-	Blobs blob.Store
-	Cfg   *config.Config
+	Blobs     blob.Store
+	Cfg       *config.Config
 }
 
 // AuthVerdicts carries pipeline stage results (Section 7.2).
 type AuthVerdicts struct {
-	SPF         string // pass | fail | softfail | none | neutral | permerror | temperror
-	DKIM        string // pass | fail | none
-	DKIMDomain  string
-	DMARC       string // pass | fail | none
-	DMARCPolicy string // none | quarantine | reject (as published; empty = none)
-	Malware     bool
-	DNSBL       string // "" = not checked / clean
+	SPF        string // pass | fail | softfail | none | neutral | permerror | temperror
+	DKIM       string // pass | fail | none
+	DKIMDomain string
+	// DKIMPassDomains: EVERY domain with a passing signature — DMARC needs
+	// the aligned one, not the first (audit item 8).
+	DKIMPassDomains []string
+	DMARC           string // pass | fail | none
+	DMARCPolicy     string // none | quarantine | reject (as published; empty = none)
+	DMARCRecord     string // the _dmarc record as published (trace/debug)
+	FromDomain      string // From domain per the standard address parser
+	Malware         bool
+	DNSBL           string // "" = not checked / clean
 }
 
 // Result reports what happened to a delivered message.

@@ -6,6 +6,7 @@ package authn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 var (
 	ErrInvalidCredentials  = errors.New("invalid credentials")
 	ErrLocked              = errors.New("account locked: too many failed logins")
+	ErrRateLimited         = errors.New("too many failed attempts from this address")
 	ErrSuspended           = errors.New("account suspended")
 	ErrAppPasswordLimit    = errors.New("app password limit reached (10 active max)")
 	ErrImpersonationDenied = errors.New("impersonation requires platform staff")
@@ -32,6 +34,11 @@ var (
 	// ErrCredentialChangeNotAllowed: impersonated sessions and API-key contexts
 	// manage credentials only through the reset flow.
 	ErrCredentialChangeNotAllowed = errors.New("this session cannot change credentials")
+	// TOTP / MFA (audit item 3).
+	ErrTOTPRequired      = errors.New("totp_code required: multi-factor authentication is enabled on this account")
+	ErrTOTPInvalid       = errors.New("invalid authenticator code")
+	ErrMFANotEnrolled    = errors.New("no pending MFA enrolment")
+	ErrMFAAlreadyEnabled = errors.New("multi-factor authentication is already enabled")
 )
 
 // AuthContext is resolved from a verified session/token — never from client
@@ -61,12 +68,23 @@ type Service struct {
 	Cfg   *config.Config
 }
 
-// Login verifies email+password with lockout (10 fails / 10 min per account and IP).
-// Login e-mails are unique per organisation, not globally (schema); when two
-// orgs share a login address the org that owns the address's domain wins, and a
-// truly ambiguous login is refused instead of silently picking one (register §1.2).
-func (s *Service) Login(ctx context.Context, email, password, ip, userAgent string) (*AuthContext, string, error) {
-	fails, err := store.CountRecentFailedLogins(ctx, s.Store.Pool, email, ip, "10 minutes")
+// Login verifies email+password (+ TOTP when enrolled) under the reworked
+// throttle (audit item 6): the account lockout counts that identity's failures
+// only — nobody can lock an account they are not attacking — and the IP gate
+// is a separate soft limit for password spraying, trusted only when the caller
+// sees the real peer address. Login e-mails are globally unique (migration 008),
+// so the old multi-org resolution below stays as a safe fallback for legacy rows.
+func (s *Service) Login(ctx context.Context, email, password, ip, userAgent, totpCode string) (*AuthContext, string, error) {
+	window := s.windowSeconds()
+	// IP gate: a spray source slows down long before any one account locks.
+	ipFails, err := store.CountFailedLoginsByIP(ctx, s.Store.Pool, ip, window)
+	if err != nil {
+		return nil, "", err
+	}
+	if ip != "" && ipFails >= s.Cfg.HTTP.LoginIPMaxFails {
+		return nil, "", ErrRateLimited
+	}
+	fails, err := store.CountFailedLoginsByEmail(ctx, s.Store.Pool, email, window)
 	if err != nil {
 		return nil, "", err
 	}
@@ -96,12 +114,39 @@ func (s *Service) Login(ctx context.Context, email, password, ip, userAgent stri
 		return nil, "", ErrInvalidCredentials
 	}
 
+	// MFA: the second factor is mandatory when enrolled (audit item 3 — one
+	// phished password must not expose a tenant).
+	if u.TotpEnabled {
+		sealed, serr := store.GetTOTPSealed(ctx, s.Store.Pool, u.ID)
+		if serr != nil || sealed == "" {
+			return nil, "", ErrTOTPRequired
+		}
+		secret, oerr := krypto.OpenSealedString(s.Cfg.KMSKeyBytes(), sealed)
+		if oerr != nil {
+			return nil, "", ErrTOTPRequired
+		}
+		if totpCode == "" {
+			return nil, "", ErrTOTPRequired
+		}
+		if !krypto.VerifyTOTP(secret, totpCode) {
+			store.RecordLoginAttempt(ctx, s.Store.Pool, email, ip, false)
+			return nil, "", ErrTOTPInvalid
+		}
+	}
+
 	store.RecordLoginAttempt(ctx, s.Store.Pool, email, ip, true)
 	ac, token, err := s.createSession(ctx, u, "web", ip, userAgent, nil, s.Cfg.HTTP.SessionTTL)
 	if err != nil {
 		return nil, "", err
 	}
 	return ac, token, nil
+}
+
+// windowSeconds renders the throttle window as a Postgres interval string so
+// SYNKRA_MAIL_LOGIN_WINDOW actually configures it (audit item 6: "10 minutes"
+// was hard-coded and the lockout-duration knob was read by nothing).
+func (s *Service) windowSeconds() string {
+	return fmt.Sprintf("%d seconds", int(s.Cfg.HTTP.LoginWindow.Seconds()))
 }
 
 // resolveLoginUser picks the login identity deterministically: one match wins;
@@ -227,7 +272,15 @@ func (s *Service) AuthenticateAppPassword(ctx context.Context, username, secret,
 		store.RecordLoginAttempt(ctx, s.Store.Pool, username, ip, false)
 		return nil, nil, ErrInvalidCredentials
 	}
-	fails, err := store.CountRecentFailedLogins(ctx, s.Store.Pool, username, ip, "10 minutes")
+	window := s.windowSeconds()
+	ipFails, err := store.CountFailedLoginsByIP(ctx, s.Store.Pool, ip, window)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ip != "" && ipFails >= s.Cfg.HTTP.LoginIPMaxFails {
+		return nil, nil, ErrRateLimited
+	}
+	fails, err := store.CountFailedLoginsByEmail(ctx, s.Store.Pool, username, window)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -399,6 +452,111 @@ func splitAddress(addr string) (local, domain string, err error) {
 }
 
 func stringsEqualFold(a, b string) bool { return strings.EqualFold(a, b) }
+
+// ---- MFA: TOTP enrolment, activation, disable (audit item 3) ----
+//
+// Enrol is two-step: the seed is stored sealed and disabled until the user
+// proves possession with a valid code, so a mistyped seed can never lock the
+// account out. Impersonated sessions may not enrol (a backdoored MFA factor is
+// a permanent credential change — Section 11.2).
+
+func (s *Service) EnrolTOTP(ctx context.Context, ac *AuthContext) (secret, otpauthURL string, err error) {
+	if !ac.CanChangeCredentials() {
+		return "", "", ErrCredentialChangeNotAllowed
+	}
+	if ac.User.TotpEnabled {
+		return "", "", ErrMFAAlreadyEnabled
+	}
+	secret = krypto.NewTOTPSecret()
+	sealed, err := krypto.SealedString(s.Cfg.KMSKeyBytes(), secret)
+	if err != nil {
+		return "", "", err
+	}
+	err = s.Store.WithTx(ctx, func(tx store.Tx) error {
+		if err := store.SetTOTPEnrolment(ctx, tx, ac.User.ID, sealed, false); err != nil {
+			return err
+		}
+		return store.RecordAudit(ctx, tx, &ac.User.ID, nil, ac.Impersonating(),
+			"mfa.enrol_started", "user", ac.User.ID.String(), "", nil)
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return secret, krypto.TOTPAuthURL("Synkra Mail", ac.User.Email, secret), nil
+}
+
+// ActivateTOTP verifies the code and turns the factor on.
+func (s *Service) ActivateTOTP(ctx context.Context, ac *AuthContext, code string) error {
+	if !ac.CanChangeCredentials() {
+		return ErrCredentialChangeNotAllowed
+	}
+	sealed, err := store.GetTOTPSealed(ctx, s.Store.Pool, ac.User.ID)
+	if err != nil || sealed == "" {
+		return ErrMFANotEnrolled
+	}
+	secret, oerr := krypto.OpenSealedString(s.Cfg.KMSKeyBytes(), sealed)
+	if oerr != nil {
+		return ErrMFANotEnrolled
+	}
+	if !krypto.VerifyTOTP(secret, code) {
+		return ErrTOTPInvalid
+	}
+	return s.Store.WithTx(ctx, func(tx store.Tx) error {
+		if err := store.SetTOTPEnrolment(ctx, tx, ac.User.ID, sealed, true); err != nil {
+			return err
+		}
+		return store.RecordAudit(ctx, tx, &ac.User.ID, nil, ac.Impersonating(),
+			"mfa.activated", "user", ac.User.ID.String(), "", nil)
+	})
+}
+
+// DisableTOTP requires the account password (not just a live session).
+func (s *Service) DisableTOTP(ctx context.Context, ac *AuthContext, password string) error {
+	if !ac.CanChangeCredentials() {
+		return ErrCredentialChangeNotAllowed
+	}
+	if ac.User.PasswordHash == "" || krypto.VerifyPassword(ac.User.PasswordHash, password) != nil {
+		return ErrInvalidCredentials
+	}
+	return s.Store.WithTx(ctx, func(tx store.Tx) error {
+		if err := store.ClearTOTP(ctx, tx, ac.User.ID); err != nil {
+			return err
+		}
+		return store.RecordAudit(ctx, tx, &ac.User.ID, nil, ac.Impersonating(),
+			"mfa.disabled", "user", ac.User.ID.String(), "", nil)
+	})
+}
+
+// ---- e-mail verification (audit item 13) ----
+
+// CreateEmailVerification mints a 48-hour one-time token for the current user.
+// The plaintext token is shown once (the response field is `dev_token` outside
+// prod; prod mails it through the platform sender).
+func (s *Service) CreateEmailVerification(ctx context.Context, ac *AuthContext) (string, error) {
+	if ac.Impersonating() {
+		return "", ErrImpersonationDenied
+	}
+	token := krypto.NewToken()
+	err := s.Store.WithTx(ctx, func(tx store.Tx) error {
+		return store.CreateVerificationToken(ctx, tx, uuid.New(), ac.User.ID,
+			krypto.SHA256Hex(token), "email", time.Now().Add(48*time.Hour))
+	})
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// VerifyEmailToken consumes a verification token.
+func (s *Service) VerifyEmailToken(ctx context.Context, token string) (uuid.UUID, error) {
+	var userID uuid.UUID
+	err := s.Store.WithTx(ctx, func(tx store.Tx) error {
+		var e error
+		userID, _, e = store.ConsumeVerificationToken(ctx, tx, krypto.SHA256Hex(token))
+		return e
+	})
+	return userID, err
+}
 
 // ---- API keys (register §13f: the API is the product) ----
 

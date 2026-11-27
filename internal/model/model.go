@@ -55,6 +55,8 @@ type User struct {
 	Email           string
 	PasswordHash    string
 	HasTOTP         bool
+	TotpEnabled     bool       // MFA active: login demands a valid code (audit item 3)
+	EmailVerifiedAt *time.Time // e-mail verification (audit item 13)
 	DisplayName     string
 	Role            string // owner | admin | member
 	IsPlatformAdmin bool
@@ -93,12 +95,19 @@ type Domain struct {
 	OrgID          *uuid.UUID // nil = platform domain
 	Name           string
 	IsPlatform     bool
-	Status         string // pending | verified | disabled
+	Status         string // pending | verified | disabled | expired | reverify
 	OwnershipToken string
 	DKIMSelector   string
-	DKIMPrivatePEM string
+	DKIMPrivatePEM string // sealed at rest ("enc1." prefix) — Section 7.6 / audit item 4
 	DKIMPublicTXT  string
 	VerifiedAt     *time.Time
+	// Staged rotation (audit item 4): the next key is generated and published
+	// first; ActivateDKIMRotation swaps it in once its DNS record resolves.
+	NextSelector   string
+	NextPrivateEnc string
+	NextPublicTXT  string
+	ReverifyDueAt  *time.Time // ownership re-check deadline (audit item 11)
+	ExpiresAt      *time.Time // unverified registrations expire (audit item 11)
 	CreatedAt      time.Time
 }
 

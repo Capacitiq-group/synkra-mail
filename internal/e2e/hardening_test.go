@@ -139,7 +139,10 @@ func TestAmbiguousLoginRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	// A second org whose owner claims the same login e-mail string.
+	// Audit item 13: login resolves by e-mail ALONE, so a shared login address
+	// across orgs is now impossible BY SCHEMA — user_email_global_idx makes
+	// the duplicate user fail. The in-code ambiguity resolver stays as a
+	// fail-safe for legacy rows.
 	orgB := &model.Org{ID: uuid.New(), Name: "ambb", PlanID: plan.ID}
 	uB := &model.User{ID: uuid.New(), OrgID: orgB.ID, Email: loginA,
 		PasswordHash: hashPassword("Passw0rd-ambb"), DisplayName: "Dup Owner", Role: "owner"}
@@ -148,21 +151,21 @@ func TestAmbiguousLoginRefused(t *testing.T) {
 			return err
 		}
 		return store.CreateUser(ctx, tx, uB)
-	}); err != nil {
-		t.Fatalf("org b: %v", err)
+	}); err == nil {
+		t.Fatal("duplicate login e-mail across orgs must be rejected by the schema")
 	}
 
-	_, _, err = s.auth.Login(ctx, loginA, pwA, "127.0.0.1", "e2e")
-	if err == nil {
-		t.Fatal("shared login e-mail must not silently resolve to one org")
+	// The single legitimate owner still logs in.
+	if _, _, err := s.auth.Login(ctx, loginA, pwA, "127.0.0.1", "e2e", ""); err != nil {
+		t.Fatalf("login after refused duplicate: %v", err)
 	}
 	st, body, _ := s.apiReq(t, "POST", "/api/v1/auth/login", "", map[string]string{"email": loginA, "password": pwA}, nil)
-	if st != http.StatusConflict || errCode(body) != "ambiguous_login" {
-		t.Fatalf("ambiguous login via api: status=%d body=%v", st, body)
+	if st != http.StatusOK {
+		t.Fatalf("login via api after refused duplicate: status=%d body=%v", st, body)
 	}
 	// A unique login still works.
 	_, _, loginC, pwC := s.provisionTenant(t, "ambc")
-	if _, _, err := s.auth.Login(ctx, loginC, pwC, "127.0.0.1", "e2e"); err != nil {
+	if _, _, err := s.auth.Login(ctx, loginC, pwC, "127.0.0.1", "e2e", ""); err != nil {
 		t.Fatalf("unambiguous login broken: %v", err)
 	}
 }
@@ -221,7 +224,10 @@ func TestThreadNoteRequiresMailboxMembership(t *testing.T) {
 	threadID := uuid.New()
 	sha := "sha-thread-" + threadID.String()
 	mid := uuid.New()
-	for _, stmt := range []struct{ q string; args []any }{
+	for _, stmt := range []struct {
+		q    string
+		args []any
+	}{
 		{`insert into mail.thread (id, org_id, subject_norm) values ($1,$2,'help please')`, []any{threadID, org.ID}},
 		{`insert into mail.blob (sha256, size_bytes, refcount) values ($1,10,1)`, []any{sha}},
 		{`insert into mail.message (id, org_id, mailbox_id, blob_sha256, direction, thread_id, subject, snippet, size_bytes, internal_date)
@@ -396,7 +402,7 @@ func TestSendIdempotency(t *testing.T) {
 	org, _, login, pw := s.provisionTenant(t, "idem")
 	token := s.login(t, login, pw)
 	sendBody := map[string]any{
-		"to": []map[string]string{{"email": "dest@outside.test"}},
+		"to":      []map[string]string{{"email": "dest@outside.test"}},
 		"subject": "idem", "text": "once only",
 	}
 	hdr := map[string]string{"Idempotency-Key": "k1"}

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,10 @@ type Querier interface {
 }
 
 // ---- users ----
+//
+// Every user read carries totp_enabled and email_verified_at (audit items 3
+// and 13): MFA enforcement and verification need them on every path, not just
+// login.
 
 func CreateUser(ctx context.Context, tx pgx.Tx, u *model.User) error {
 	_, err := tx.Exec(ctx, `insert into mail.user (id, org_id, email, password_hash, display_name, role, is_platform_admin, status)
@@ -28,14 +33,14 @@ func CreateUser(ctx context.Context, tx pgx.Tx, u *model.User) error {
 
 func GetUser(ctx context.Context, q Querier, id uuid.UUID) (*model.User, error) {
 	row := q.QueryRow(ctx, `select id, org_id, email, coalesce(password_hash,''),
-		(totp_secret_enc is not null), display_name, role, is_platform_admin, status, created_at, updated_at
+		(totp_secret_enc is not null), totp_enabled, email_verified_at, display_name, role, is_platform_admin, status, created_at, updated_at
 		from mail.user where id=$1`, id)
 	return scanUser(row)
 }
 
 func GetUserByEmail(ctx context.Context, q Querier, email string) (*model.User, error) {
 	row := q.QueryRow(ctx, `select id, org_id, email, coalesce(password_hash,''),
-		(totp_secret_enc is not null), display_name, role, is_platform_admin, status, created_at, updated_at
+		(totp_secret_enc is not null), totp_enabled, email_verified_at, display_name, role, is_platform_admin, status, created_at, updated_at
 		from mail.user where email=$1`, email)
 	return scanUser(row)
 }
@@ -45,7 +50,7 @@ func GetUserByEmail(ctx context.Context, q Querier, email string) (*model.User, 
 // legitimately share a login address; login resolves that explicitly (authn).
 func ListUsersByEmail(ctx context.Context, q Querier, email string) ([]model.User, error) {
 	rows, err := q.Query(ctx, `select id, org_id, email, coalesce(password_hash,''),
-		(totp_secret_enc is not null), display_name, role, is_platform_admin, status, created_at, updated_at
+		(totp_secret_enc is not null), totp_enabled, email_verified_at, display_name, role, is_platform_admin, status, created_at, updated_at
 		from mail.user where email=$1 order by created_at`, email)
 	if err != nil {
 		return nil, err
@@ -64,7 +69,7 @@ func ListUsersByEmail(ctx context.Context, q Querier, email string) ([]model.Use
 
 func ListUsersByOrg(ctx context.Context, q Querier, orgID uuid.UUID) ([]model.User, error) {
 	rows, err := q.Query(ctx, `select id, org_id, email, coalesce(password_hash,''),
-		(totp_secret_enc is not null), display_name, role, is_platform_admin, status, created_at, updated_at
+		(totp_secret_enc is not null), totp_enabled, email_verified_at, display_name, role, is_platform_admin, status, created_at, updated_at
 		from mail.user where org_id=$1 order by created_at`, orgID)
 	if err != nil {
 		return nil, err
@@ -83,8 +88,8 @@ func ListUsersByOrg(ctx context.Context, q Querier, orgID uuid.UUID) ([]model.Us
 
 func scanUser(row pgx.Row) (*model.User, error) {
 	var u model.User
-	err := row.Scan(&u.ID, &u.OrgID, &u.Email, &u.PasswordHash, &u.HasTOTP, &u.DisplayName,
-		&u.Role, &u.IsPlatformAdmin, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	err := row.Scan(&u.ID, &u.OrgID, &u.Email, &u.PasswordHash, &u.HasTOTP, &u.TotpEnabled, &u.EmailVerifiedAt,
+		&u.DisplayName, &u.Role, &u.IsPlatformAdmin, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, notFound(err)
 	}
@@ -222,17 +227,41 @@ func RevokeAllUserAppPasswords(ctx context.Context, tx pgx.Tx, userID uuid.UUID)
 	return err
 }
 
-// ---- login rate limiting (Section 7.1: 10 fails / 10 min per account and per IP) ----
+// ---- login rate limiting (Section 7.1; reworked per audit item 6) ----
+//
+// The old query counted failures by `email OR ip` in one number: any third
+// party could lock any account by failing logins from a spoofed XFF, and the
+// same failure fed both limits. Now the two limits are independent:
+//
+//   - the ACCOUNT lockout counts that e-mail's own failures only (brute force
+//     against one identity);
+//   - the IP gate counts that source address's failures only (password
+//     spraying) — a soft 429, never an account lock, and only trustworthy when
+//     the caller can see the real peer address.
 
 func RecordLoginAttempt(ctx context.Context, q Querier, email, ip string, ok bool) {
 	_, _ = q.Exec(ctx, `insert into mail.login_attempt (email, ip, ok) values ($1,$2,$3)`, optText(email), optText(ip), ok)
 }
 
-func CountRecentFailedLogins(ctx context.Context, q Querier, email, ip string, window string) (int, error) {
+// CountFailedLoginsByEmail: failures of one identity inside the window.
+func CountFailedLoginsByEmail(ctx context.Context, q Querier, email string, window string) (int, error) {
 	var n int
 	err := q.QueryRow(ctx, `select count(*) from mail.login_attempt
-		where ok=false and created_at > now() - $1::interval
-		  and (($2 <> '' and email=$2) or ($3 <> '' and ip=$3))`, window, optText(email), optText(ip)).Scan(&n)
+		where ok=false and created_at > now() - $1::interval and email=$2`, window, optText(email)).Scan(&n)
+	if err != nil && errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+// CountFailedLoginsByIP: failures from one source address inside the window.
+func CountFailedLoginsByIP(ctx context.Context, q Querier, ip string, window string) (int, error) {
+	if ip == "" {
+		return 0, nil
+	}
+	var n int
+	err := q.QueryRow(ctx, `select count(*) from mail.login_attempt
+		where ok=false and created_at > now() - $1::interval and ip=$2`, window, ip).Scan(&n)
 	if err != nil && errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
@@ -244,4 +273,102 @@ func CountRecentFailedLogins(ctx context.Context, q Querier, email, ip string, w
 func RevokeOtherUserSessions(ctx context.Context, tx pgx.Tx, userID, keepSessionID uuid.UUID) error {
 	_, err := tx.Exec(ctx, `update mail.session set revoked_at=now() where user_id=$1 and revoked_at is null and id <> $2`, userID, keepSessionID)
 	return err
+}
+
+// ---- TOTP enrolment (audit item 3: one phished staff password must not
+// expose every tenant; the seed column existed, nothing used it) ----
+
+// SetTOTPEnrolment stores the sealed seed; enabled=false until the user proves
+// possession of the authenticator with a valid code (activation step).
+func SetTOTPEnrolment(ctx context.Context, tx pgx.Tx, userID uuid.UUID, sealedSecret string, enabled bool) error {
+	_, err := tx.Exec(ctx, `update mail.user set totp_secret_enc=$2, totp_enabled=$3, updated_at=now() where id=$1`,
+		userID, sealedSecret, enabled)
+	return err
+}
+
+// ClearTOTP disables MFA and erases the seed.
+func ClearTOTP(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `update mail.user set totp_secret_enc=null, totp_enabled=false, updated_at=now() where id=$1`, userID)
+	return err
+}
+
+// GetTOTPSealed returns the sealed seed ("" when none).
+func GetTOTPSealed(ctx context.Context, q Querier, userID uuid.UUID) (string, error) {
+	var enc *string
+	err := q.QueryRow(ctx, `select totp_secret_enc from mail.user where id=$1`, userID).Scan(&enc)
+	if err != nil {
+		return "", notFound(err)
+	}
+	if enc == nil {
+		return "", nil
+	}
+	return *enc, nil
+}
+
+// ---- e-mail verification (audit item 13) ----
+
+func CreateVerificationToken(ctx context.Context, tx pgx.Tx, id uuid.UUID, userID uuid.UUID, tokenHash, kind string, expiresAt time.Time) error {
+	_, err := tx.Exec(ctx, `insert into mail.verification_token (id, user_id, token_hash, kind, expires_at)
+		values ($1,$2,$3,$4,$5)`, id, userID, tokenHash, kind, expiresAt)
+	return err
+}
+
+// ConsumeVerificationToken marks the token used and verifies the user's
+// e-mail in the same transaction. Returns ErrNotFound when the token is
+// unknown, used, or expired.
+func ConsumeVerificationToken(ctx context.Context, tx pgx.Tx, tokenHash string) (userID uuid.UUID, kind string, err error) {
+	err = tx.QueryRow(ctx, `update mail.verification_token set used_at=now()
+		where token_hash=$1 and used_at is null and expires_at > now()
+		returning user_id, kind`, tokenHash).Scan(&userID, &kind)
+	if err != nil {
+		return uuid.Nil, "", notFound(err)
+	}
+	if kind == "email" {
+		if _, err = tx.Exec(ctx, `update mail.user set email_verified_at=now(), updated_at=now() where id=$1`, userID); err != nil {
+			return uuid.Nil, "", err
+		}
+	}
+	return userID, kind, nil
+}
+
+// ---- session management surface (missing-features audit: list + revoke) ----
+
+func ListSessionsByUser(ctx context.Context, q Querier, userID uuid.UUID) ([]SessionView, error) {
+	rows, err := q.Query(ctx, `select id, user_id, token_hash, kind, coalesce(ip,''), coalesce(user_agent,''),
+		impersonated_by, expires_at, revoked_at, created_at
+		from mail.session where user_id=$1 and revoked_at is null and expires_at > now()
+		order by created_at desc`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SessionView
+	for rows.Next() {
+		var s model.Session
+		if err := rows.Scan(&s.ID, &s.UserID, &s.TokenHash, &s.Kind, &s.IP, &s.UserAgent,
+			&s.ImpersonatedBy, &s.ExpiresAt, &s.RevokedAt, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, SessionView{Session: s})
+	}
+	return out, rows.Err()
+}
+
+// SessionView is a session row prepared for the API surface.
+type SessionView struct {
+	Session model.Session
+}
+
+// RevokeSessionForUser revokes one of the user's own sessions (never another
+// user's); ErrNotFound when it is not theirs.
+func RevokeSessionForUser(ctx context.Context, tx pgx.Tx, userID, sessionID uuid.UUID) error {
+	ct, err := tx.Exec(ctx, `update mail.session set revoked_at=now()
+		where id=$1 and user_id=$2 and revoked_at is null`, sessionID, userID)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

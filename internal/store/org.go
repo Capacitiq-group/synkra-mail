@@ -183,3 +183,22 @@ func ListOrgsByReviewStatus(ctx context.Context, q Querier, reviewStatus string,
 	}
 	return out, rows.Err()
 }
+
+// GetOrgOwnerAddress resolves the org owner's primary mailbox address — the
+// destination for breaker/policy owner alerts (Section 7.3, audit item 18).
+func GetOrgOwnerAddress(ctx context.Context, q Querier, orgID uuid.UUID) (string, error) {
+	var addr string
+	err := q.QueryRow(ctx, `
+		select a.local::text || '@' || d.name::text
+		from mail.user u
+		join mail.mailbox mb on mb.owner_user_id = u.id and mb.kind='user'
+		join mail.address a on a.mailbox_id = mb.id and a.is_primary
+		join mail.domain d on d.id = a.domain_id
+		where u.org_id=$1 and u.status='active'
+		order by case u.role when 'owner' then 0 when 'admin' then 1 else 2 end, u.created_at
+		limit 1`, orgID).Scan(&addr)
+	if err != nil {
+		return "", notFound(err)
+	}
+	return addr, nil
+}

@@ -203,8 +203,6 @@ func TestValidAddress(t *testing.T) {
 		"first.last+tag@sub.example.co.za",
 		"o'brien@example.com",
 		"USER_1@EXAMPLE.IO",
-		"user@[192.0.2.1]",
-		"user@[IPv6:2001:db8::1]",
 		strings.Repeat("a", 64) + "@example.com",
 	}
 	for _, s := range valid {
@@ -226,6 +224,8 @@ func TestValidAddress(t *testing.T) {
 		"a@example-.com",
 		"a@[192.0.2.1",
 		"a@[not-a-literal]",
+		"user@[192.0.2.1]",
+		"user@[IPv6:2001:db8::1]",
 		".dot@example.com",
 		"dot.@example.com",
 		"do..t@example.com",

@@ -7,11 +7,11 @@ package imapd
 import (
 	"bytes"
 	"context"
-	"log"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sort"
 	"strings"

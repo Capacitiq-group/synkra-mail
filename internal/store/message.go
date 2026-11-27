@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -394,30 +395,113 @@ func ExpungeItem(ctx context.Context, tx pgx.Tx, folderID uuid.UUID, uid uint32)
 	if err != nil {
 		return uuid.Nil, notFound(err)
 	}
-	// Last copy gone → remove the message row and drop a blob ref.
 	var cnt int
 	err = tx.QueryRow(ctx, `select count(*) from mail.mailbox_item where message_id=$1`, messageID).Scan(&cnt)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	if cnt == 0 {
-		var sha string
-		if err := tx.QueryRow(ctx, `delete from mail.message where id=$1 returning blob_sha256`, messageID).Scan(&sha); err != nil {
-			return uuid.Nil, err
-		}
-		if err := ReleaseBlobRef(ctx, tx, sha); err != nil {
+		if err := purgeMessageRow(ctx, tx, messageID); err != nil {
 			return uuid.Nil, err
 		}
 	}
 	return messageID, nil
 }
 
+// ExpungeItemNow hard-deletes an item without requiring the \Deleted flag:
+// the API delete-from-Trash path never had a way to set it, so the expunge
+// always returned "not found" (audit item 25). The IMAP path keeps the strict
+// flag check above.
+func ExpungeItemNow(ctx context.Context, tx pgx.Tx, folderID uuid.UUID, uid uint32) (messageID uuid.UUID, err error) {
+	err = tx.QueryRow(ctx, `delete from mail.mailbox_item
+                where folder_id=$1 and uid=$2 returning message_id`, folderID, uid).Scan(&messageID)
+	if err != nil {
+		return uuid.Nil, notFound(err)
+	}
+	var cnt int
+	err = tx.QueryRow(ctx, `select count(*) from mail.mailbox_item where message_id=$1`, messageID).Scan(&cnt)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if cnt == 0 {
+		if err := purgeMessageRow(ctx, tx, messageID); err != nil {
+			return uuid.Nil, err
+		}
+	}
+	return messageID, nil
+}
+
+// purgeMessageRow removes a message row and every child that references it,
+// releasing each blob reference on the way out (audit item 25: deleting the
+// message row alone hit foreign-key violations from attachments and delivery
+// jobs, and attachment blobs were never released).
+func purgeMessageRow(ctx context.Context, tx pgx.Tx, messageID uuid.UUID) error {
+	// Tracking leaves (reference the message directly).
+	if _, err := tx.Exec(ctx, `delete from mail.click_event ce using mail.tracked_link tl
+		where ce.link_id = tl.id and tl.message_id=$1`, messageID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `delete from mail.tracked_link where message_id=$1`, messageID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `delete from mail.open_event oe using mail.tracking_pixel tp
+		where oe.pixel_id = tp.id and tp.message_id=$1`, messageID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `delete from mail.tracking_pixel where message_id=$1`, messageID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `delete from mail.delivery_event where message_id=$1`, messageID); err != nil {
+		return err
+	}
+	// Delivery jobs + their DSNs (jobs reference the message row).
+	if _, err := tx.Exec(ctx, `delete from mail.dsn d using mail.delivery_job j
+		where d.delivery_job_id = j.id and j.message_id=$1`, messageID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `delete from mail.delivery_job where message_id=$1`, messageID); err != nil {
+		return err
+	}
+	// Attachments: release every blob ref, then drop the rows.
+	attRows, err := tx.Query(ctx, `delete from mail.attachment where message_id=$1 returning blob_sha256`, messageID)
+	if err != nil {
+		return err
+	}
+	var attSHAs []string
+	for attRows.Next() {
+		var sha string
+		if err := attRows.Scan(&sha); err != nil {
+			attRows.Close()
+			return err
+		}
+		attSHAs = append(attSHAs, sha)
+	}
+	attRows.Close()
+	if err := attRows.Err(); err != nil {
+		return err
+	}
+	for _, sha := range attSHAs {
+		if err := ReleaseBlobRef(ctx, tx, sha); err != nil {
+			return err
+		}
+	}
+	// The message row itself.
+	var sha string
+	if err := tx.QueryRow(ctx, `delete from mail.message where id=$1 returning blob_sha256`, messageID).Scan(&sha); err != nil {
+		return err
+	}
+	return ReleaseBlobRef(ctx, tx, sha)
+}
+
 // SearchMessages: metadata + FTS (Section 4.4 hot indexes; target p95 < 1 s).
+// The ILIKE pattern escapes LIKE metacharacters (audit item 27: a query of
+// "100%" previously matched everything and could never match a literal "%").
 func SearchMessages(ctx context.Context, q Querier, mailboxID uuid.UUID, query string, limit int) ([]ItemWithMessage, error) {
 	if query == "" || mailboxID == uuid.Nil {
 		return nil, nil
 	}
-	pattern := "%" + query + "%"
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
+	pattern := "%" + esc + "%"
 	rows, err := q.Query(ctx, `select i.id, i.folder_id, i.message_id, i.uid, i.flags, i.deleted_at, i.created_at,
                 m.id, m.org_id, m.mailbox_id, m.blob_sha256, m.direction, coalesce(m.message_id::text,''), coalesce(m.in_reply_to::text,''),
                 m.refs, m.thread_id, coalesce(m.from_email::text,''), coalesce(m.from_name,''), m.to_addrs, m.cc_addrs,

@@ -12,11 +12,11 @@
 package trackingd
 
 import (
-	"github.com/google/uuid"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/google/uuid"
 	"log"
 	"net/http"
 	"net/url"
@@ -118,10 +118,10 @@ func (s *Service) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) postUnsubscribe(orgID, mailboxID uuid.UUID, rcpt string) {
 	payload := map[string]any{
-		"kind":      "unsubscribe",
-		"org_id":    orgID.String(),
+		"kind":       "unsubscribe",
+		"org_id":     orgID.String(),
 		"mailbox_id": mailboxID.String(),
-		"rcpt":      rcpt,
+		"rcpt":       rcpt,
 	}
 	body, _ := json.Marshal(payload)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

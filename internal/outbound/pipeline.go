@@ -4,8 +4,8 @@ package outbound
 
 import (
 	"bytes"
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -118,7 +118,22 @@ func (p *Pipeline) ComposeAndQueue(ctx context.Context, userID, orgID uuid.UUID,
 // the raw message is already built by the client. What the client wrote is
 // kept verbatim; only what it omitted (Message-ID, Date) is supplied, and
 // admission runs against the same rules as the webmail compose.
+//
+// Envelope recipients are ALWAYS merged into admission (audit item 2): the
+// old code merged them only when the client sent no To/Cc headers, so Bcc and
+// envelope-only recipients skipped suppression, address validation, limit
+// counting — and went onto the wire unvalidated.
 func (p *Pipeline) QueueSubmission(ctx context.Context, userID, orgID uuid.UUID, raw []byte, envFrom string, rcpts []string) error {
+	// Second-From (and friends) is the known signature/authorisation bypass:
+	// the client's message may name exactly one From header (audit item 9).
+	if mimeutil.CountHeader(raw, "From") > 1 {
+		return fmt.Errorf("%w: 5.6.0 multiple From headers rejected", ErrInvalidAddress)
+	}
+	for _, h := range []string{"Subject", "Date"} {
+		if mimeutil.CountHeader(raw, h) > 1 {
+			return fmt.Errorf("%w: 5.6.0 duplicate %s header rejected", ErrInvalidAddress, h)
+		}
+	}
 	parsed, err := mimeutil.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("cannot parse submitted message: %w", err)
@@ -156,15 +171,27 @@ func (p *Pipeline) QueueSubmission(ctx context.Context, userID, orgID uuid.UUID,
 		Date:        parsed.Date,
 		Track:       false, // submission clients don't get rewrites unless the org toggle + webmail path
 	}
-	// A client may name its recipients only in the envelope (Bcc only, or no
-	// recipient header at all). Those addresses are admitted as Bcc: envelope
-	// only, so the stored To stays what the client wrote and the message is
-	// not touched.
-	if len(parsed.To) == 0 && len(parsed.Cc) == 0 {
-		in.Bcc = make([]mimeutil.Addr, 0, len(rcpts))
-		for _, r := range dedupe(rcpts) {
-			in.Bcc = append(in.Bcc, mimeutil.Addr{Email: strings.TrimSpace(r)})
+	// Envelope recipients (Bcc comes envelope-only from normal mail clients)
+	// join the admission set as Bcc: validated, suppressed and counted like
+	// every other recipient. The stored To/Cc stay what the client wrote and
+	// the message body is not touched.
+	headerEmails := map[string]struct{}{}
+	for _, l := range [][]mimeutil.Addr{parsed.To, parsed.Cc} {
+		for _, a := range l {
+			headerEmails[strings.ToLower(strings.TrimSpace(a.Email))] = struct{}{}
 		}
+	}
+	in.Bcc = make([]mimeutil.Addr, 0, len(rcpts))
+	for _, r := range dedupe(rcpts) {
+		e := strings.TrimSpace(r)
+		if !mimeutil.ValidAddress(e) {
+			// Never let an unvalidated string reach `RCPT TO:<%s>` (audit item 2).
+			return fmt.Errorf("%w: 5.1.3 bad envelope recipient %q", ErrInvalidAddress, r)
+		}
+		if _, dup := headerEmails[strings.ToLower(e)]; dup {
+			continue
+		}
+		in.Bcc = append(in.Bcc, mimeutil.Addr{Email: e})
 	}
 	// The client's raw message is the deliverable (Sent copy + jobs reference it);
 	// admission re-uses the build path only for validation and tracking metadata.
@@ -272,11 +299,6 @@ func (p *Pipeline) admissionAndBuild(ctx context.Context, fromMailbox *model.Mai
 		return nil, fmt.Errorf("%w: every recipient is suppressed (hard bounce or unsubscribe)", ErrLimitExceeded)
 	}
 
-	// Tiered limits (Section 7.3) count recipients we will actually attempt.
-	if err := p.checkLimits(ctx, org, fromMailbox, len(sendable)); err != nil {
-		return nil, err
-	}
-
 	// Compose headers reflect what will actually be delivered.
 	in.To = withoutSuppressed(in.To, suppressed)
 	in.Cc = withoutSuppressed(in.Cc, suppressed)
@@ -300,47 +322,48 @@ func (p *Pipeline) admissionAndBuild(ctx context.Context, fromMailbox *model.Mai
 	if int64(len(adm.raw)) > p.Cfg.MaxMessageBytes {
 		return nil, fmt.Errorf("%w (%d MB)", ErrMessageTooLarge, p.Cfg.MaxMessageBytes>>20)
 	}
+	// Tiered limits (Section 7.3) reserve atomically for exactly the
+	// recipients we will attempt (audit item 20: COUNT-then-send raced under
+	// concurrency and every cap could be overshot).
+	if err := p.reserveLimits(ctx, org, fromMailbox, len(sendable)); err != nil {
+		return nil, err
+	}
 	return adm, nil
 }
 
-func (p *Pipeline) checkLimits(ctx context.Context, org *model.Org, fromMailbox *model.Mailbox, rcptCount int) error {
-	var dailyOrg int
-	var err error
+// reserveLimits consumes the org/mailbox/warmup budgets in single-statement
+// atomic reservations. A failed message build after a reservation leaks a few
+// reserved slots — the conservative direction (never over the cap).
+func (p *Pipeline) reserveLimits(ctx context.Context, org *model.Org, fromMailbox *model.Mailbox, sendable int) error {
+	day := time.Now().Format("20060102")
+	hour := time.Now().Format("2006010215")
+	var orgCap, mboxCap int
+	var mboxWindow string
 	if org.Tier == "verified" {
-		dailyOrg, err = store.CountSentSince(ctx, p.Store.Pool, org.ID, nil, time.Now().Add(-24*time.Hour))
-		if err != nil {
-			return err
-		}
-		if dailyOrg+rcptCount > p.Cfg.Limits.VerifiedOrgDaily {
-			return fmt.Errorf("%w: org daily cap %d", ErrLimitExceeded, p.Cfg.Limits.VerifiedOrgDaily)
-		}
-		mbDaily, err := store.CountSentSince(ctx, p.Store.Pool, org.ID, &fromMailbox.ID, time.Now().Add(-24*time.Hour))
-		if err != nil {
-			return err
-		}
-		if mbDaily+rcptCount > p.Cfg.Limits.VerifiedMailboxDaily {
-			return fmt.Errorf("%w: mailbox daily cap %d", ErrLimitExceeded, p.Cfg.Limits.VerifiedMailboxDaily)
-		}
-		return nil
+		orgCap, mboxCap, mboxWindow = p.Cfg.Limits.VerifiedOrgDaily, p.Cfg.Limits.VerifiedMailboxDaily, day
+	} else {
+		// New-org tier: 100/day org, 20/hour mailbox (Section 7.3).
+		orgCap, mboxCap, mboxWindow = p.Cfg.Limits.NewOrgDaily, p.Cfg.Limits.NewMailboxHourly, hour
 	}
-
-	// New-org tier: 100/day org, 20/hour mailbox, 50 recipients (Section 7.3).
-	dailyOrg, err = store.CountSentSince(ctx, p.Store.Pool, org.ID, nil, time.Now().Add(-24*time.Hour))
-	if err != nil {
+	if ok, err := store.ReserveSend(ctx, p.Store.Pool, "org:"+org.ID.String()+":"+day, sendable, orgCap); err != nil {
 		return err
+	} else if !ok {
+		return fmt.Errorf("%w: org %s cap %d reached", ErrLimitExceeded, org.Tier, orgCap)
 	}
-	if dailyOrg+rcptCount > p.Cfg.Limits.NewOrgDaily {
-		return fmt.Errorf("%w: new-org daily cap %d", ErrLimitExceeded, p.Cfg.Limits.NewOrgDaily)
-	}
-	mbHourly, err := store.CountSentSince(ctx, p.Store.Pool, org.ID, &fromMailbox.ID, time.Now().Add(-1*time.Hour))
-	if err != nil {
+	if ok, err := store.ReserveSend(ctx, p.Store.Pool, "mb:"+fromMailbox.ID.String()+":"+mboxWindow, sendable, mboxCap); err != nil {
 		return err
+	} else if !ok {
+		return fmt.Errorf("%w: mailbox cap %d reached", ErrLimitExceeded, mboxCap)
 	}
-	if mbHourly+rcptCount > p.Cfg.Limits.NewMailboxHourly {
-		return fmt.Errorf("%w: new-org hourly cap %d", ErrLimitExceeded, p.Cfg.Limits.NewMailboxHourly)
-	}
-	if p.Cfg.WarmupDailyCap > 0 && dailyOrg+rcptCount > p.Cfg.WarmupDailyCap {
-		return fmt.Errorf("%w: warmup cap %d", ErrLimitExceeded, p.Cfg.WarmupDailyCap)
+	// Warmup (owner decision, Section 8.3): a per-IP budget shared by every
+	// org on the sending IP — the old check was per-org, so N tenants each
+	// got the whole IP's budget (audit item 20).
+	if p.Cfg.WarmupDailyCap > 0 {
+		if ok, err := store.ReserveSend(ctx, p.Store.Pool, "ip:warmup:"+day, sendable, p.Cfg.WarmupDailyCap); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("%w: IP warmup cap %d reached", ErrLimitExceeded, p.Cfg.WarmupDailyCap)
+		}
 	}
 	return nil
 }
@@ -370,8 +393,8 @@ func (p *Pipeline) SendAutoReply(ctx context.Context, mailboxID, orgID uuid.UUID
 		subject = "Re: " + inSubject
 	}
 	in := ComposeInput{
-		From: mimeutil.Addr{Email: from, Name: fromName},
-		To:   []mimeutil.Addr{{Email: to}},
+		From:    mimeutil.Addr{Email: from, Name: fromName},
+		To:      []mimeutil.Addr{{Email: to}},
 		Subject: subject, Text: ar.Body,
 	}
 	userID := uuid.Nil

@@ -124,6 +124,13 @@ func main() {
 		for _, r := range strings.Split(*only, ",") {
 			roles[strings.TrimSpace(r)] = true
 		}
+	} else if cfg.Env == "prod" {
+		// The tracker is a PUBLIC unauthenticated service; in prod it must run
+		// as its own process (`maild -only tracker`) without database
+		// credentials reachable from it (audit: isolation posture).
+		for _, r := range []string{"api", "smtp", "submission", "imap", "worker", "janitor"} {
+			roles[r] = true
+		}
 	} else {
 		for _, r := range []string{"api", "smtp", "submission", "imap", "worker", "tracker", "janitor"} {
 			roles[r] = true
@@ -134,10 +141,15 @@ func main() {
 
 	if roles["api"] {
 		apiSrv := &api.Server{Cfg: cfg, Auth: authSvc, Store: st, Pipeline: pipeline, Blobs: blobStore}
+		// Full request deadlines, not only header timeouts (audit item 5:
+		// slow-body attacks held connections open indefinitely).
 		httpSrv := &http.Server{
 			Addr:              cfg.HTTPAddr,
-			Handler:           withMiddleware(apiSrv.Routes()),
+			Handler:           withMiddleware(apiSrv.Routes(), cfg.TrustedProxy),
 			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       60 * time.Second,
+			WriteTimeout:      120 * time.Second,
+			IdleTimeout:       120 * time.Second,
 		}
 		go func() { errCh <- httpSrv.ListenAndServe() }()
 		log.Printf("[api] listening on %s", cfg.HTTPAddr)
@@ -184,9 +196,24 @@ func main() {
 	}
 
 	if roles["worker"] {
-		var transport outbound.Transport = &outbound.LoopbackTransport{Deps: deps}
-		if cfg.Env == "prod" {
-			transport = &outbound.SMTPTransport{HeloName: cfg.Hostname}
+		// Transport selection is EXPLICIT (audit item 7): "auto" means smtp in
+		// prod and loopback in dev; forcing a value overrides the env. A
+		// mistyped SYNKRA_MAIL_ENV can no longer silently discard mail —
+		// config.Load refuses unknown env values outright.
+		var transport outbound.Transport
+		chosen := cfg.OutboundTransport
+		if chosen == "auto" {
+			if cfg.Env == "prod" {
+				chosen = "smtp"
+			} else {
+				chosen = "loopback"
+			}
+		}
+		switch chosen {
+		case "smtp":
+			transport = &outbound.SMTPTransport{HeloName: cfg.Hostname, SourceIP: cfg.OutboundSourceIP}
+		default:
+			transport = &outbound.LoopbackTransport{Deps: deps}
 		}
 		workers := cfg.WorkerCount
 		if workers < 1 {
@@ -201,8 +228,7 @@ func main() {
 			}()
 		}
 		defer gracefulQueueDrain(workerWG)
-		log.Printf("[worker] %d outbound workers started (transport=%s)", workers,
-			map[bool]string{true: "smtp", false: "loopback"}[cfg.Env == "prod"])
+		log.Printf("[worker] %d outbound workers started (transport=%s, concurrency=%d)", workers, chosen, cfg.WorkerConcurrency)
 	}
 
 	if roles["janitor"] {
@@ -227,6 +253,9 @@ func main() {
 			Addr:              cfg.TrackerAddr,
 			Handler:           tracker.Routes(),
 			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
 		}
 		go func() { errCh <- httpT.ListenAndServe() }()
 		log.Printf("[tracker] isolated tracking service on %s (core=%s)", cfg.TrackerAddr, cfg.HTTPAddr)
@@ -302,10 +331,14 @@ func bootstrap(ctx context.Context, cfg *config.Config, st *store.Store) error {
 	})
 }
 
-func withMiddleware(h http.Handler) http.Handler {
+func withMiddleware(h http.Handler, trustProxy bool) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
-	r.Use(chimw.RealIP)
+	// RealIP honours X-Forwarded-For ONLY when a trusted proxy fronts the
+	// process (audit item 6: an untrusted XFF spoofed the throttle key).
+	if trustProxy {
+		r.Use(chimw.RealIP)
+	}
 	r.Use(chimw.Recoverer)
 	r.Mount("/", h)
 	return r

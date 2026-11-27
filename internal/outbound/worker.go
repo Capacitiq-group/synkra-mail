@@ -5,7 +5,6 @@ package outbound
 
 import (
 	"bytes"
-	"net/http"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -16,8 +15,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/textproto"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-msgauth/dkim"
@@ -80,18 +81,95 @@ func (w *Worker) Run(ctx context.Context) {
 
 // Tick claims and processes one batch. Webhook deliveries (§13f) go first:
 // they are small, best-effort, and never block the delivery batch.
+//
+// Jobs run concurrently (audit item 19: four single-threaded workers meant a
+// few tarpitting destinations stalled ALL outbound mail), bounded by
+// SYNKRA_MAIL_WORKER_CONCURRENCY with a per-destination-domain gate so one
+// slow domain cannot occupy every slot.
 func (w *Worker) Tick(ctx context.Context) error {
 	w.dispatchWebhooks(ctx)
 	jobs, err := store.ClaimDueJobs(ctx, w.Pipeline.Store.Pool, w.ID, 10*time.Minute, 20)
 	if err != nil {
 		return err
 	}
+	if len(jobs) == 0 {
+		return nil
+	}
+	conc := w.Pipeline.Cfg.WorkerConcurrency
+	if conc < 1 {
+		conc = 1
+	}
+	sem := make(chan struct{}, conc)
+	gate := newDomainGate(2) // max 2 in flight per recipient domain
+	var wg sync.WaitGroup
 	for i := range jobs {
-		if err := w.processJob(ctx, &jobs[i]); err != nil {
-			log.Printf("[worker] job %s: %v", jobs[i].ID, err)
+		j := jobs[i]
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		}
+		if err := gate.acquire(ctx, rcptDomain(j.EnvelopeTo)); err != nil {
+			<-sem
+			wg.Wait()
+			return err
+		}
+		wg.Add(1)
+		go func(j model.DeliveryJob) {
+			defer wg.Done()
+			defer func() { <-sem; gate.release(rcptDomain(j.EnvelopeTo)) }()
+			if err := w.processJob(ctx, &j); err != nil {
+				if errors.Is(err, store.ErrLeaseLost) {
+					// Another worker reclaimed the expired lease and will
+					// deliver it; writing our result would duplicate (audit item 17).
+					log.Printf("[worker] job %s lease lost (reclaimed by another worker); skipped", j.ID)
+					return
+				}
+				log.Printf("[worker] job %s: %v", j.ID, err)
+			}
+		}(j)
+	}
+	wg.Wait()
+	return nil
+}
+
+// domainGate bounds concurrent deliveries per recipient domain.
+type domainGate struct {
+	mu    sync.Mutex
+	max   int
+	inUse map[string]int
+}
+
+func newDomainGate(max int) *domainGate {
+	return &domainGate{max: max, inUse: map[string]int{}}
+}
+
+func (g *domainGate) acquire(ctx context.Context, domain string) error {
+	for {
+		g.mu.Lock()
+		if g.inUse[domain] < g.max {
+			g.inUse[domain]++
+			g.mu.Unlock()
+			return nil
+		}
+		g.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return nil
+}
+
+func (g *domainGate) release(domain string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.inUse[domain] <= 1 {
+		delete(g.inUse, domain)
+		return
+	}
+	g.inUse[domain]--
 }
 
 // processJob handles one claimed job end-to-end.
@@ -111,7 +189,14 @@ func (w *Worker) processJob(ctx context.Context, j *model.DeliveryJob) error {
 		return w.deferJob(ctx, j, j.Attempts, 5*time.Minute, "451", "4.3.0 message load failed: "+err.Error())
 	}
 
-	code, msg, err := w.Transport.Deliver(ctx, j.EnvelopeFrom, j.EnvelopeTo, full)
+	// Envelope identity: VERP per job (audit item 21 — bounce correlation) so
+	// an async bounce or an ARF complaint names the exact recipient/job. The
+	// loopback transport keeps the sender address (there is no wire).
+	envFrom := j.EnvelopeFrom
+	if w.VERPEnabled() {
+		envFrom = "bnc+" + j.ID.String() + "@" + w.Pipeline.Cfg.Hostname
+	}
+	code, msg, err := w.Transport.Deliver(ctx, envFrom, j.EnvelopeTo, full)
 	if err == nil && code >= 200 && code < 300 {
 		return w.completeJob(ctx, j, code, msg)
 	}
@@ -121,9 +206,15 @@ func (w *Worker) processJob(ctx context.Context, j *model.DeliveryJob) error {
 	}
 
 	if code >= 500 {
-		return w.hardBounce(ctx, j, org, code, msg)
+		return w.rejectJob(ctx, j, org, code, msg)
 	}
 	return w.deferJob(ctx, j, j.Attempts+1, 0, fmt.Sprintf("%d", code), msg)
+}
+
+// VERPEnabled: real-SMTP transport only; the loopback path has no bounce wire.
+func (w *Worker) VERPEnabled() bool {
+	_, isLoop := w.Transport.(*LoopbackTransport)
+	return !isLoop
 }
 
 // loadSignedMessage loads the composed RFC822 and applies our DKIM signature
@@ -151,7 +242,13 @@ func (w *Worker) loadSignedMessage(ctx context.Context, j *model.DeliveryJob) ([
 	if derr != nil || dom.DKIMPrivatePEM == "" {
 		return raw, nil // unsigned (dev domains); prod seeds keys for every hosted domain
 	}
-	signed, err := dkimSign(raw, domain, dom.DKIMSelector, dom.DKIMPrivatePEM)
+	// The private key is stored sealed ("enc1.") — audit item 4; legacy
+	// plaintext rows still open (dev bootstrap).
+	privatePEM, oerr := krypto.OpenSealedString(w.Pipeline.Cfg.KMSKeyBytes(), dom.DKIMPrivatePEM)
+	if oerr != nil {
+		return nil, fmt.Errorf("dkim key: %w", oerr)
+	}
+	signed, err := dkimSign(raw, domain, dom.DKIMSelector, privatePEM)
 	if err != nil {
 		return nil, fmt.Errorf("dkim sign: %w", err)
 	}
@@ -174,7 +271,16 @@ func dkimSign(raw []byte, domain, selector, privatePEM string) ([]byte, error) {
 		Signer:                 key,
 		HeaderCanonicalization: dkim.CanonicalizationRelaxed,
 		BodyCanonicalization:   dkim.CanonicalizationRelaxed,
-		HeaderKeys:             []string{"From", "To", "Cc", "Subject", "Date", "Message-ID", "MIME-Version", "In-Reply-To", "References", "Reply-To", "List-Unsubscribe"},
+		// Oversigning (audit item 9): listing From/To/Cc/Subject twice signs
+		// the bottom two instances of each, so an attacker-injected duplicate
+		// header breaks the signature instead of silently winning. Content-Type
+		// was not signed at all before (a body-part swap changed meaning).
+		HeaderKeys: []string{
+			"From", "From", "To", "To", "Cc", "Cc", "Subject", "Subject",
+			"Content-Type", "Content-Type",
+			"Date", "Message-ID", "MIME-Version", "In-Reply-To", "References",
+			"Reply-To", "List-Unsubscribe",
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -265,6 +371,138 @@ func (w *Worker) deferJob(ctx context.Context, j *model.DeliveryJob, attempts in
 	return nil
 }
 
+// bounceClass is what a 5xx reply actually means for THIS recipient (audit
+// item 18: every 5xx was treated as "bad recipient", so an IP blocklist hit
+// permanently suppressed healthy mailboxes and fed the breaker).
+type bounceClass string
+
+const (
+	bounceRecipientUnknown bounceClass = "recipient_unknown" // suppress + breaker
+	bouncePolicyReject     bounceClass = "policy_reject"     // our IP/reputation: never suppress
+	bounceMailboxFull      bounceClass = "mailbox_full"      // recipient-side storage: soft
+	bounceOtherHard        bounceClass = "other_hard"        // unknown 5xx: suppress (conservative)
+)
+
+// classifyBounce reads the enhanced status code (and, failing that, the reply
+// text) out of a 5xx rejection.
+func classifyBounce(code int, msg string) bounceClass {
+	enh := enhancedCodeOf(code, msg)
+	switch {
+	case strings.HasPrefix(enh, "5.1."):
+		// 5.1.1 bad destination, 5.1.6 user moved, 5.1.10 bad recipient mailbox.
+		return bounceRecipientUnknown
+	case strings.HasPrefix(enh, "5.7."):
+		// 5.7.1 delivery-not-authorized / policy reasons: blocklists, spam
+		// filters, reputation walls. The recipient's address is fine.
+		return bouncePolicyReject
+	case enh == "5.2.2":
+		return bounceMailboxFull
+	}
+	m := strings.ToLower(msg)
+	policyHints := []string{"blocked", "blacklist", "blocklist", "policy", "reputation", "spam", "abuse", "rbl", "dnsbl"}
+	for _, h := range policyHints {
+		if strings.Contains(m, h) {
+			return bouncePolicyReject
+		}
+	}
+	fullHints := []string{"mailbox full", "mailbox is full", "over quota", "storage", "insufficient system storage"}
+	for _, h := range fullHints {
+		if strings.Contains(m, h) {
+			return bounceMailboxFull
+		}
+	}
+	unknownHints := []string{"unknown user", "user unknown", "no such user", "no such mailbox", "does not exist", "recipient rejected", "invalid recipient", "no such domain", "address invalid"}
+	for _, h := range unknownHints {
+		if strings.Contains(m, h) {
+			return bounceRecipientUnknown
+		}
+	}
+	return bounceOtherHard
+}
+
+// enhancedCodeOf pulls "x.y.z" out of the reply text (RFC 3463), falling back
+// to a class-only "x.y.0" derived from the numeric reply code.
+func enhancedCodeOf(code int, msg string) string {
+	for _, f := range strings.Fields(msg) {
+		if n := len(f); n >= 5 && n <= 7 && f[0] >= '2' && f[0] <= '5' && f[1] == '.' && f[3] == '.' {
+			return f
+		}
+	}
+	if code >= 500 {
+		return fmt.Sprintf("5.%d.0", (code/10)%10)
+	}
+	return fmt.Sprintf("%d.0.0", code/100)
+}
+
+// rejectJob: a 5xx reply — dispatch on what it actually means.
+func (w *Worker) rejectJob(ctx context.Context, j *model.DeliveryJob, org *model.Org, code int, msg string) error {
+	switch classifyBounce(code, msg) {
+	case bouncePolicyReject:
+		return w.policyReject(ctx, j, org, code, msg)
+	case bounceMailboxFull:
+		return w.softFinalBounce(ctx, j, code, msg)
+	default: // recipient_unknown + other_hard: suppress + breaker + owner rules
+		return w.hardBounce(ctx, j, org, code, msg)
+	}
+}
+
+// policyReject: our sending identity was refused (blocklist/reputation). The
+// recipient address is healthy — suppressing it would poison the customer's
+// list (audit item 18). Bounce to the sender, alert the owner, never suppress,
+// never feed the hard-bounce breaker.
+func (w *Worker) policyReject(ctx context.Context, j *model.DeliveryJob, org *model.Org, code int, msg string) error {
+	err := w.Pipeline.Store.WithTx(ctx, func(tx store.Tx) error {
+		if err := store.BounceJob(ctx, tx, j.ID, j.Attempts+1, fmt.Sprintf("%d", code), msg); err != nil {
+			return err
+		}
+		hard := false
+		if err := store.RecordDSN(ctx, tx, &model.DSN{
+			ID: uuid.New(), DeliveryJobID: j.ID, Kind: "bounce", IsHard: &hard,
+			SMTPCode: fmt.Sprintf("%d", code), Reason: "policy: " + msg,
+		}); err != nil {
+			return err
+		}
+		detail, _ := json.Marshal(map[string]any{
+			"rcpt": j.EnvelopeTo, "code": code, "message": msg,
+			"note": "remote policy rejection — check IP reputation; recipient NOT suppressed",
+		})
+		if err := store.RecordRateEvent(ctx, tx, org.ID, &j.MailboxID, "policy_reject", string(detail)); err != nil {
+			return err
+		}
+		return recordJobEvent(ctx, tx, j, "bounced", fmt.Sprintf("%d", code), "policy: "+msg)
+	})
+	if err != nil {
+		return err
+	}
+	w.injectDSN(ctx, j, "bounce", false, fmt.Sprintf("%d", code), "delivery refused by the receiving system's policy: "+msg)
+	w.injectOwnerAlert(ctx, org, "Outbound policy rejections",
+		fmt.Sprintf("Mail to %s was refused by the receiving system (policy/reputation). Recipients were not suppressed; check the sending IP reputation.", j.EnvelopeTo))
+	return nil
+}
+
+// softFinalBounce: recipient-side condition (mailbox full) — no suppression,
+// no breaker, one soft bounce after the retry budget.
+func (w *Worker) softFinalBounce(ctx context.Context, j *model.DeliveryJob, code int, msg string) error {
+	err := w.Pipeline.Store.WithTx(ctx, func(tx store.Tx) error {
+		if err := store.BounceJob(ctx, tx, j.ID, j.Attempts+1, fmt.Sprintf("%d", code), msg); err != nil {
+			return err
+		}
+		hard := false
+		if err := store.RecordDSN(ctx, tx, &model.DSN{
+			ID: uuid.New(), DeliveryJobID: j.ID, Kind: "bounce", IsHard: &hard,
+			SMTPCode: fmt.Sprintf("%d", code), Reason: msg,
+		}); err != nil {
+			return err
+		}
+		return recordJobEvent(ctx, tx, j, "bounced", fmt.Sprintf("%d", code), msg)
+	})
+	if err != nil {
+		return err
+	}
+	w.injectDSN(ctx, j, "bounce", false, fmt.Sprintf("%d", code), msg)
+	return nil
+}
+
 func (w *Worker) hardBounce(ctx context.Context, j *model.DeliveryJob, org *model.Org, code int, msg string) error {
 	err := w.Pipeline.Store.WithTx(ctx, func(tx store.Tx) error {
 		// One hard bounce per mailbox at a time: the breaker counts completed
@@ -298,6 +536,16 @@ func (w *Worker) hardBounce(ctx context.Context, j *model.DeliveryJob, org *mode
 	}
 	// Backscatter-safe bounce notice to our own sender, post-commit (Section 5.1).
 	w.injectDSN(ctx, j, "bounce", true, fmt.Sprintf("%d", code), msg)
+	// Owner alert when the breaker paused this mailbox (Section 7.3 says one
+	// is sent; audit item 18: nothing ever sent it).
+	if mb, merr := store.GetMailbox(ctx, w.Pipeline.Store.Pool, j.MailboxID); merr == nil && mb.SendStatus == "paused_bounces" {
+		reason := mb.PausedReason
+		if reason == "" {
+			reason = "hard-bounce rate over the breaker threshold"
+		}
+		w.injectOwnerAlert(ctx, org, "Sending paused: hard-bounce breaker tripped",
+			"Mailbox sending was paused: "+reason+" Review the suppression list, then resume the mailbox from the console.")
+	}
 	return nil
 }
 
@@ -335,6 +583,33 @@ func (w *Worker) injectDSN(ctx context.Context, j *model.DeliveryJob, kind strin
 	defer cancel()
 	if err := ingest.DeliverLoopback(dctx, w.Deps, raw, "", j.EnvelopeFrom); err != nil {
 		log.Printf("[worker] dsn inject to %s: %v", j.EnvelopeFrom, err)
+	}
+}
+
+// injectOwnerAlert delivers a platform notification into the org owner's
+// mailbox through the loopback pipeline (best effort — never blocks delivery).
+func (w *Worker) injectOwnerAlert(ctx context.Context, org *model.Org, subject, body string) {
+	if w.Deps == nil {
+		return
+	}
+	addr, err := store.GetOrgOwnerAddress(ctx, w.Pipeline.Store.Pool, org.ID)
+	if err != nil || addr == "" {
+		log.Printf("[worker] owner alert routing for org %s: %v", org.ID, err)
+		return
+	}
+	raw := fmt.Sprintf("From: Synkra Mail Platform <postmaster@%s>\r\n"+
+		"To: %s\r\n"+
+		"Subject: %s\r\n"+
+		"Date: %s\r\n"+
+		"Content-Type: text/plain; charset=utf-8\r\n"+
+		"\r\n%s\r\n",
+		w.Pipeline.Cfg.Hostname, addr,
+		strings.Join(strings.Fields(subject), " "),
+		time.Now().Format(time.RFC1123Z), body)
+	actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := ingest.DeliverLoopback(actx, w.Deps, []byte(raw), "", addr); err != nil {
+		log.Printf("[worker] owner alert to %s: %v", addr, err)
 	}
 }
 
@@ -419,44 +694,85 @@ func (t *LoopbackTransport) Deliver(ctx context.Context, envFrom, rcptTo string,
 	return 250, "delivered (loopback)", nil
 }
 
-// SMTPTransport: real outbound delivery (production). Hosts by MX preference
-// with the implicit-MX fallback; one connection per attempt — if the envelope
-// has been opened on a host, no second host may take it (RFC 5321 5.1). TLS is
-// opportunistic but never silently downgraded: a certificate that fails
-// verification gets exactly one unverified-TLS attempt (still encrypted); a
-// host that does not advertise STARTTLS is logged and used in cleartext.
+// SMTPTransport: real outbound delivery (production). MX hosts are tried in
+// preference order (audit item 20: only the first MX was used, so a down
+// primary bounced mail the backup could have taken), the connection speaks a
+// correct RFC 3207 sequence — EHLO, the STARTTLS command, the 220 reply, and
+// only THEN the TLS handshake (audit item 1: the handshake was attempted
+// directly, so every real server saw a ClientHello where an SMTP command
+// belongs and mail retried for 72h before bouncing) — and egress is filtered:
+// no address literals, no MX targets on private ranges (audit item 10).
+// TLS is opportunistic but never silently downgraded: a certificate that
+// fails verification gets exactly one unverified-TLS attempt (still
+// encrypted); a host that does not advertise STARTTLS is logged and used in
+// cleartext.
 type SMTPTransport struct {
 	// HostPort override (staging/tests point at a local fake server); empty = MX lookup.
 	HostPort string
-	// HeloName is our EHLO identity; empty: "localhost" (callers pass the
-	// configured mail hostname).
+	// HeloName is our EHLO identity; empty: the configured hostname.
 	HeloName string
 	Timeout  time.Duration
+	// SourceIP binds the outbound connection to a local address (audit item 20).
+	SourceIP string
+	// SkipEgressFilter is for tests against loopback fakes (HostPort set).
+	SkipEgressFilter bool
 }
 
 func (t *SMTPTransport) Deliver(ctx context.Context, envFrom, rcptTo string, raw []byte) (int, string, error) {
-	host := t.HostPort
-	if host == "" {
-		h, err := pickMXHost(rcptTo)
-		if err != nil {
-			return 550, err.Error(), err // null MX: the domain accepts no mail
+	if t.HostPort != "" {
+		return t.deliverTo(ctx, t.HostPort, envFrom, rcptTo, raw)
+	}
+	hosts, code, msg, err := pickMXHosts(rcptTo)
+	if err != nil {
+		return code, msg, err
+	}
+	var lastErr error
+	for _, host := range hosts {
+		c, ext, err := t.connect(ctx, host, t.helo(), true)
+		if err != nil && isCertError(err) {
+			// One unverified-TLS retry (encrypted but unauthenticated). After
+			// that: abort — never fall back to cleartext mid-flight (Section 7.5).
+			c, ext, err = t.connect(ctx, host, t.helo(), false)
 		}
-		host = h
+		if err != nil {
+			lastErr = err
+			continue // next MX by preference
+		}
+		code, msg, err := t.converse(ctx, c, ext, host, envFrom, rcptTo, raw)
+		if err != nil && code == 0 && lastErr == nil {
+			lastErr = err
+			continue // network-level failure on this host: try the next MX
+		}
+		return code, msg, err
 	}
-	helo := t.HeloName
-	if helo == "" {
-		helo = "localhost"
+	if lastErr != nil {
+		return 0, "", lastErr
 	}
+	return 451, "4.4.4 no usable MX host", errors.New("no usable MX host")
+}
 
-	c, ext, err := t.connect(ctx, host, helo, true)
+func (t *SMTPTransport) helo() string {
+	if t.HeloName != "" {
+		return t.HeloName
+	}
+	return "localhost"
+}
+
+// deliverTo runs connect + converse against one fixed host (HostPort override
+// used by staging and tests).
+func (t *SMTPTransport) deliverTo(ctx context.Context, host, envFrom, rcptTo string, raw []byte) (int, string, error) {
+	c, ext, err := t.connect(ctx, host, t.helo(), true)
 	if err != nil && isCertError(err) {
-		// One unverified-TLS retry (encrypted but unauthenticated). After
-		// that: abort — never fall back to cleartext mid-flight (Section 7.5).
-		c, ext, err = t.connect(ctx, host, helo, false)
+		c, ext, err = t.connect(ctx, host, t.helo(), false)
 	}
 	if err != nil {
 		return 0, "", err
 	}
+	return t.converse(ctx, c, ext, host, envFrom, rcptTo, raw)
+}
+
+// converse runs the MAIL/RCPT/DATA dialogue on an established connection.
+func (t *SMTPTransport) converse(ctx context.Context, c *textproto.Conn, ext map[string]bool, host, envFrom, rcptTo string, raw []byte) (int, string, error) {
 	defer c.Close()
 	if !ext["STARTTLS"] && t.HostPort == "" {
 		log.Printf("[outbound] %s does not offer STARTTLS; sending in cleartext", hostOnly(host))
@@ -517,32 +833,47 @@ func (t *SMTPTransport) Deliver(ctx context.Context, envFrom, rcptTo string, raw
 	return fcode, fmsg, nil
 }
 
-// pickMXHost resolves where to deliver for rcptTo: MX records by preference
-// (RFC 5321 5.1), implicit MX when no record exists, and RFC 7505 null MX
-// (hard reject — the domain explicitly accepts no mail). Address literals
-// (user@[192.0.2.1], user@[IPv6:…]) dial the literal.
-func pickMXHost(rcptTo string) (string, error) {
+// pickMXHosts resolves where to deliver for rcptTo, in try order: MX records
+// by preference (RFC 5321 5.1), implicit MX when no record exists, RFC 7505
+// null MX (hard reject — the domain explicitly accepts no mail). NXDOMAIN
+// fails fast as a permanent bounce instead of retrying 72 hours (audit item
+// 20); transient DNS errors stay deferrable. Address literals are refused
+// outright (audit item 10).
+func pickMXHosts(rcptTo string) (hosts []string, code int, msg string, err error) {
 	domain := rcptTo[strings.LastIndex(rcptTo, "@")+1:]
-	if strings.HasPrefix(domain, "[") && strings.HasSuffix(domain, "]") {
-		lit := strings.TrimSuffix(strings.TrimPrefix(domain, "["), "]")
-		if strings.HasPrefix(strings.ToLower(lit), "ipv6:") {
-			lit = lit[len("ipv6:"):]
+	if strings.HasPrefix(domain, "[") {
+		return nil, 550, "5.1.3 address literals are not accepted", errors.New("address literal recipient refused")
+	}
+	mxs, lerr := net.LookupMX(domain)
+	if lerr != nil {
+		var de *net.DNSError
+		if errors.As(lerr, &de) && de.IsNotFound {
+			// The domain does not exist: retrying for 72h only queues
+			// backscatter (audit item 20) — fail fast, permanently.
+			return nil, 550, "5.1.2 domain does not exist", lerr
 		}
-		return lit, nil
+		// Transient resolver trouble: deferrable.
+		return nil, 451, "4.4.3 temporary DNS failure: " + lerr.Error(), lerr
 	}
-	mxs, err := net.LookupMX(domain)
-	if err != nil || len(mxs) == 0 {
+	for _, m := range mxs {
+		h := strings.TrimSuffix(m.Host, ".")
+		if h == "" || h == "." {
+			return nil, 550, "5.1.2 null MX: domain does not accept mail", errors.New("null MX")
+		}
+		hosts = append(hosts, h)
+	}
+	if len(hosts) == 0 {
 		// No MX record → the domain itself is the implicit MX (A/AAAA).
-		return domain, nil
+		hosts = []string{domain}
 	}
-	if h := strings.TrimSuffix(mxs[0].Host, "."); h == "" || h == "." {
-		return "", errors.New("5.1.2 null MX: domain does not accept mail")
-	}
-	return strings.TrimSuffix(mxs[0].Host, "."), nil
+	return hosts, 0, "", nil
 }
 
-// connect dials host:25 (a HostPort keeps its own port), greets, and upgrades
-// to TLS when advertised. verify controls certificate verification (Section 7.5).
+// connect dials host:25 (a HostPort keeps its own port), greets, upgrades via
+// the RFC 3207 sequence when advertised, and refuses to dial private or
+// loopback targets (audit item 10: MX records pointing at 127.0.0.1, RFC 1918
+// or link-local space were dialled happily — an SSRF door for any tenant).
+// verify controls certificate verification (Section 7.5).
 func (t *SMTPTransport) connect(ctx context.Context, host, helo string, verify bool) (*textproto.Conn, map[string]bool, error) {
 	d := t.Timeout
 	if d == 0 {
@@ -552,7 +883,18 @@ func (t *SMTPTransport) connect(ctx context.Context, host, helo string, verify b
 	if _, _, perr := net.SplitHostPort(host); perr != nil {
 		addr = host + ":25"
 	}
-	conn, err := net.DialTimeout("tcp", addr, d)
+	if !t.SkipEgressFilter && t.HostPort == "" {
+		if err := egressAllowed(ctx, host); err != nil {
+			return nil, nil, err
+		}
+	}
+	dialer := &net.Dialer{Timeout: d}
+	if t.SourceIP != "" {
+		if src := net.ParseIP(t.SourceIP); src != nil {
+			dialer.LocalAddr = &net.TCPAddr{IP: src}
+		}
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -570,6 +912,21 @@ func (t *SMTPTransport) connect(ctx context.Context, host, helo string, verify b
 	}
 	if !ext["STARTTLS"] {
 		return c, ext, nil
+	}
+	// RFC 3207 4: send STARTTLS, read the 220 Go-ahead, and only then
+	// handshake. The old code skipped the command entirely, so real servers
+	// answered "502/503" to a TLS ClientHello and every send retried to death.
+	id, serr := c.Cmd("STARTTLS")
+	if serr != nil {
+		c.Close()
+		return nil, nil, serr
+	}
+	c.StartResponse(id)
+	_, _, aerr := c.ReadResponse(220)
+	c.EndResponse(id)
+	if aerr != nil {
+		c.Close()
+		return nil, nil, fmt.Errorf("starttls: %w", aerr)
 	}
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName: hostOnly(host), MinVersion: tls.VersionTLS12,
@@ -589,6 +946,35 @@ func (t *SMTPTransport) connect(ctx context.Context, host, helo string, verify b
 		return nil, nil, err
 	}
 	return nc, ext, nil
+}
+
+// egressAllowed refuses MX hosts that resolve into private, loopback,
+// link-local or otherwise non-routable space. It also blocks a hostname whose
+// first lookup fails transiently (fail closed: we cannot verify where it goes).
+func egressAllowed(ctx context.Context, host string) error {
+	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	resolver := &net.Resolver{}
+	addrs, err := resolver.LookupIPAddr(hctx, host)
+	if err != nil {
+		return fmt.Errorf("4.4.3 cannot resolve %s for egress check: %w", host, err)
+	}
+	for _, ia := range addrs {
+		ip := ia.IP
+		if !ip.IsGlobalUnicast() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			return fmt.Errorf("5.7.1 refusing to deliver to non-public address space (%s)", ip)
+		}
+	}
+	// Carrier-grade NAT (100.64/10) and benchmark space (198.18/15) are not
+	// IsPrivate() but are still not public destinations.
+	for _, ia := range addrs {
+		if v4 := ia.IP.To4(); v4 != nil {
+			if v4[0] == 100 || (v4[0] == 198 && v4[1] == 18) || v4[0] == 0 {
+				return fmt.Errorf("5.7.1 refusing to deliver to non-public address space (%s)", ia.IP)
+			}
+		}
+	}
+	return nil
 }
 
 // ehlo greets (falling back to HELO for ancient servers) and returns the

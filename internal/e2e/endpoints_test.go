@@ -153,10 +153,10 @@ func TestChangeOwnPassword(t *testing.T) {
 	if st, _, _ = s.apiReq(t, "GET", "/api/v1/me", tok2, nil, nil); st != http.StatusUnauthorized {
 		t.Fatalf("other sessions must be revoked: status=%d", st)
 	}
-	if _, _, err := s.auth.Login(context.Background(), login, pw, "127.0.0.2", "e2e"); err == nil {
+	if _, _, err := s.auth.Login(context.Background(), login, pw, "127.0.0.2", "e2e", ""); err == nil {
 		t.Fatal("old password must stop working")
 	}
-	if _, _, err := s.auth.Login(context.Background(), login, "NewPassw0rd-9", "127.0.0.2", "e2e"); err != nil {
+	if _, _, err := s.auth.Login(context.Background(), login, "NewPassw0rd-9", "127.0.0.2", "e2e", ""); err != nil {
 		t.Fatalf("new password must work: %v", err)
 	}
 }
@@ -193,7 +193,7 @@ func TestOrgUsersSuspendRevoke(t *testing.T) {
 	if st != http.StatusOK {
 		t.Fatalf("suspend: status=%d", st)
 	}
-	if _, _, err := s.auth.Login(context.Background(), teammateEmail, "Passw0rd-users", "127.0.0.2", "e2e"); err == nil {
+	if _, _, err := s.auth.Login(context.Background(), teammateEmail, "Passw0rd-users", "127.0.0.2", "e2e", ""); err == nil {
 		t.Fatal("suspended user must not log in")
 	}
 	st, _, _ = s.apiReq(t, "POST", "/api/v1/org/users/"+teammateID+"/resume", ownerTok, nil, nil)
