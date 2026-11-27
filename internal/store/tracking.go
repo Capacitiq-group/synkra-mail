@@ -193,3 +193,45 @@ func QuarantineMessage(ctx context.Context, tx pgx.Tx, qrt *model.Quarantine) er
 		qrt.ID, qrt.OrgID, optUUID(qrt.MailboxID), optUUID(qrt.MessageID), qrt.Reason, qrt.Score, qrt.ExpiresAt)
 	return err
 }
+
+// QuarantineView pairs a quarantine row with the message it holds.
+type QuarantineView struct {
+	Row     model.Quarantine
+	Subject string
+	Snippet string
+}
+
+// ListQuarantine lists the org's live (unexpired) quarantine rows.
+func ListQuarantine(ctx context.Context, q Querier, orgID uuid.UUID, limit int) ([]QuarantineView, error) {
+	rows, err := q.Query(ctx, `select q.id, q.org_id, q.mailbox_id, q.message_id, q.reason, coalesce(q.score,0), q.expires_at, q.created_at,
+		coalesce(m.subject,''), coalesce(m.snippet,'')
+		from mail.quarantine q left join mail.message m on m.id = q.message_id
+		where q.org_id=$1 and q.expires_at > now() order by q.created_at desc limit $2`, orgID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []QuarantineView
+	for rows.Next() {
+		var v QuarantineView
+		if err := rows.Scan(&v.Row.ID, &v.Row.OrgID, &v.Row.MailboxID, &v.Row.MessageID, &v.Row.Reason, &v.Row.Score, &v.Row.ExpiresAt, &v.Row.CreatedAt,
+			&v.Subject, &v.Snippet); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// ReleaseQuarantine removes the quarantine row and reports whether a message
+// row was attached. Re-injecting that message into its mailbox lands with the
+// spam verdict engines (disabled by design for the pilot) — the audit trail is
+// written today (build register §2.11).
+func ReleaseQuarantine(ctx context.Context, tx pgx.Tx, id, orgID uuid.UUID) (hadMessage bool, err error) {
+	var mid *uuid.UUID
+	err = tx.QueryRow(ctx, `delete from mail.quarantine where id=$1 and org_id=$2 returning message_id`, id, orgID).Scan(&mid)
+	if err != nil {
+		return false, notFound(err)
+	}
+	return mid != nil, nil
+}

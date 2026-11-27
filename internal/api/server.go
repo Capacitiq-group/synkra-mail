@@ -44,6 +44,26 @@ func (s *Server) Routes() http.Handler {
 			r.Use(s.requireSession)
 			r.Get("/me", s.handleMe)
 			r.Post("/auth/logout", s.handleLogout)
+			r.Post("/me/password", s.handleChangeOwnPassword)
+
+			// Org users and shared mailboxes (register §2.6-2.9).
+			r.Get("/org/users", s.handleListOrgUsers)
+			r.Post("/org/users/{id}/suspend", s.handleSuspendOrgUser)
+			r.Post("/org/users/{id}/resume", s.handleResumeOrgUser)
+			r.Post("/org/users/{id}/revoke-sessions", s.handleRevokeUserSessions)
+			r.Get("/org/shared-mailboxes/{id}/members", s.handleListSharedMailboxMembers)
+			r.Post("/org/shared-mailboxes/{id}/members", s.handleAddSharedMailboxMember)
+			r.Delete("/org/shared-mailboxes/{id}/members", s.handleRemoveSharedMailboxMember)
+
+			// Quarantine (register §2.11): the spam verdict engines are hook
+			// points only for now; the console surface ships with them.
+			r.Get("/org/quarantine", s.handleListQuarantine)
+			r.Post("/org/quarantine/{id}/release", s.handleReleaseQuarantine)
+
+			// Attachments (register §2.10): blobs stored and referenced; these
+			// routes serve them (★ hard webmail prerequisite).
+			r.Get("/messages/{id}/attachments", s.handleListAttachments)
+			r.Get("/messages/{id}/attachments/{att_id}", s.handleGetAttachment)
 
 			r.Get("/app-passwords", s.handleListAppPasswords)
 			r.Post("/app-passwords", s.handleCreateAppPassword)
@@ -88,9 +108,13 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/admin/orgs", s.handleAdminListOrgs)
 			r.Post("/admin/orgs", s.handleAdminCreateOrg)
 			r.Post("/admin/orgs/{id}/approve", s.handleAdminApproveOrg)
+			r.Post("/admin/orgs/{id}/decline", s.handleAdminDeclineOrg)
 			r.Post("/admin/orgs/{id}/suspend", s.handleAdminSuspendOrg)
 			r.Post("/admin/orgs/{id}/resume", s.handleAdminResumeOrg)
 			r.Post("/admin/orgs/{id}/impersonate", s.handleAdminImpersonate)
+			r.Post("/admin/impersonation/{id}/end", s.handleAdminEndImpersonation)
+			r.Post("/admin/mailboxes/{id}/resume", s.handleAdminResumeMailbox)
+			r.Get("/admin/suppression", s.handleAdminListSuppression)
 			r.Get("/admin/audit", s.handleAdminAudit)
 			r.Get("/admin/queue", s.handleAdminQueue)
 			r.Get("/admin/stats", s.handleAdminStats)

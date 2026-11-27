@@ -219,3 +219,21 @@ func RecordRateEvent(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, mailboxID 
 		uuid.New(), orgID, optUUID(mailboxID), kind, detailJSON)
 	return err
 }
+
+// ListSuppressionAll lists suppressions across orgs (admin console, register §2.4).
+func ListSuppressionAll(ctx context.Context, q Querier, limit int) ([]model.Suppression, error) {
+	rows, err := q.Query(ctx, `select org_id, email, reason, created_at from mail.suppression order by created_at desc limit $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Suppression
+	for rows.Next() {
+		var s model.Suppression
+		if err := rows.Scan(&s.OrgID, &s.Email, &s.Reason, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}

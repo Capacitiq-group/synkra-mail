@@ -162,3 +162,24 @@ func ResolveSendingState(ctx context.Context, q Querier, org *model.Org) (*OrgSe
 	}
 	return st, nil
 }
+
+// ListOrgsByReviewStatus filters the review queue (register §2.1).
+func ListOrgsByReviewStatus(ctx context.Context, q Querier, reviewStatus string, limit int) ([]model.Org, error) {
+	rows, err := q.Query(ctx, `select id, name, plan_id, status, tier, sending_enabled,
+                coalesce(sending_blocked_reason,''), review_status, tracking_enabled, storage_overage_gb, synkra_org_id, created_at, updated_at
+                from mail.org where review_status=$1 order by created_at desc limit $2`, reviewStatus, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Org
+	for rows.Next() {
+		var o model.Org
+		if err := rows.Scan(&o.ID, &o.Name, &o.PlanID, &o.Status, &o.Tier, &o.SendingEnabled,
+			&o.SendingBlockedReason, &o.ReviewStatus, &o.TrackingEnabled, &o.StorageOverageGB, &o.SynkraOrgID, &o.CreatedAt, &o.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}

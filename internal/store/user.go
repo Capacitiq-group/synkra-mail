@@ -238,3 +238,10 @@ func CountRecentFailedLogins(ctx context.Context, q Querier, email, ip string, w
 	}
 	return n, err
 }
+
+// RevokeOtherUserSessions revokes every session of a user except one (the
+// session that performed a credential change keeps working).
+func RevokeOtherUserSessions(ctx context.Context, tx pgx.Tx, userID, keepSessionID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `update mail.session set revoked_at=now() where user_id=$1 and revoked_at is null and id <> $2`, userID, keepSessionID)
+	return err
+}

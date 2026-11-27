@@ -46,6 +46,9 @@ manageable first release.
 | K | Idempotency keys (§1.9) | POST /send, address (alias) creation and domain create/verify accept an Idempotency-Key header; the first response is stored per user + key and replayed; a key reused with a different body is a 422. |
 | L | App-password lockout (§1.6) | IMAP and submission logins share the web login's 10-fails/10-minute lockout. Submission keys it by login identity + source IP; IMAP keys it by login identity (go-imap v2 beta.8 exposes no remote address to sessions). |
 | M | Message-list pagination (§1.8) | GET /messages pages by uid cursor (limit, default 50 / max 200; before_uid), newest page first, ascending order inside a page — the folder is never loaded whole. |
+| N | Org-invite decline (§2.1) | There is no pending user-invite object to decline (invites create users immediately); "decline" maps to the org review application: POST /admin/orgs/{id}/decline plus a review_status filter on the queue. |
+| O | Quarantine release (§2.11) | Release removes the quarantine row and audits it; re-injecting the held message lands with the spam verdict engines (hook points only, disabled by design for the pilot). |
+| P | Attachment API (§2.10) | The list + download routes serve existing attachment blobs; mimeutil.Att gained JSON tags so the send API reads content_type correctly. |
 
 ### Explicitly still pending
 

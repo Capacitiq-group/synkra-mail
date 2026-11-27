@@ -268,6 +268,30 @@ func (s *Service) RevokeAppPassword(ctx context.Context, ac *AuthContext, apID u
 	})
 }
 
+// ChangeOwnPassword: POST /me/password (register §2.5). Verifies the current
+// password, keeps the acting session alive and revokes every other session of
+// the user. Impersonated sessions cannot change credentials (Section 11.2).
+func (s *Service) ChangeOwnPassword(ctx context.Context, ac *AuthContext, current, next string) error {
+	if !ac.CanChangeCredentials() {
+		return errors.New("impersonated sessions cannot manage credentials")
+	}
+	if len(next) < 8 {
+		return errors.New("new password must be at least 8 characters")
+	}
+	if ac.User.PasswordHash == "" || krypto.VerifyPassword(ac.User.PasswordHash, current) != nil {
+		return ErrInvalidCredentials
+	}
+	return s.Store.WithTx(ctx, func(tx store.Tx) error {
+		if err := store.SetUserPassword(ctx, tx, ac.User.ID, krypto.HashPassword(next)); err != nil {
+			return err
+		}
+		if err := store.RevokeOtherUserSessions(ctx, tx, ac.User.ID, ac.Session.ID); err != nil {
+			return err
+		}
+		return store.RecordAudit(ctx, tx, &ac.User.ID, nil, false, "password.change", "user", ac.User.ID.String(), "", nil)
+	})
+}
+
 // ---- impersonation (Section 11.2) ----
 
 // Impersonate creates a 60-minute, audited, guard-railed staff session.

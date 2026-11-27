@@ -468,3 +468,35 @@ func RecordStorageLedger(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, month 
 		uuid.New(), orgID, month, overageGB, optText(note))
 	return err
 }
+
+// ---- attachments (register §2.10: blobs are stored and referenced; these are
+// the routes that serve them) ----
+
+func ListAttachments(ctx context.Context, q Querier, messageID uuid.UUID) ([]model.Attachment, error) {
+	rows, err := q.Query(ctx, `select id, message_id, blob_sha256, coalesce(filename,''), content_type, size_bytes, is_inline, coalesce(content_id,'')
+		from mail.attachment where message_id=$1 order by id`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Attachment
+	for rows.Next() {
+		var a model.Attachment
+		if err := rows.Scan(&a.ID, &a.MessageID, &a.BlobSHA256, &a.Filename, &a.ContentType, &a.SizeBytes, &a.IsInline, &a.ContentID); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func GetAttachment(ctx context.Context, q Querier, attID uuid.UUID) (*model.Attachment, error) {
+	row := q.QueryRow(ctx, `select id, message_id, blob_sha256, coalesce(filename,''), content_type, size_bytes, is_inline, coalesce(content_id,'')
+		from mail.attachment where id=$1`, attID)
+	var a model.Attachment
+	err := row.Scan(&a.ID, &a.MessageID, &a.BlobSHA256, &a.Filename, &a.ContentType, &a.SizeBytes, &a.IsInline, &a.ContentID)
+	if err != nil {
+		return nil, notFound(err)
+	}
+	return &a, nil
+}

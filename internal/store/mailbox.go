@@ -363,3 +363,33 @@ func SetFolderSubscribed(ctx context.Context, tx pgx.Tx, folderID uuid.UUID, sub
 	_, err := tx.Exec(ctx, `update mail.folder set subscribed=$2 where id=$1`, folderID, subscribed)
 	return err
 }
+
+// MemberView pairs a mailbox membership with the member's login identity.
+type MemberView struct {
+	Member model.MailboxMember
+	User   model.User
+}
+
+// ListMembers lists a mailbox's members (register §2.9): the shared-mailbox
+// admin surface reads through this.
+func ListMembers(ctx context.Context, q Querier, mailboxID uuid.UUID) ([]MemberView, error) {
+	rows, err := q.Query(ctx, `select mm.id, mm.mailbox_id, mm.user_id, mm.role, mm.created_at,
+		u.id, u.org_id, u.email::text, '', (u.totp_secret_enc is not null), u.display_name, u.role, u.is_platform_admin, u.status, u.created_at, u.updated_at
+		from mail.mailbox_member mm join mail.user u on u.id = mm.user_id
+		where mm.mailbox_id=$1 order by mm.created_at`, mailboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MemberView
+	for rows.Next() {
+		var v MemberView
+		if err := rows.Scan(&v.Member.ID, &v.Member.MailboxID, &v.Member.UserID, &v.Member.Role, &v.Member.CreatedAt,
+			&v.User.ID, &v.User.OrgID, &v.User.Email, &v.User.PasswordHash, &v.User.HasTOTP, &v.User.DisplayName,
+			&v.User.Role, &v.User.IsPlatformAdmin, &v.User.Status, &v.User.CreatedAt, &v.User.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}

@@ -139,7 +139,14 @@ func domainViews(ds []model.Domain) []map[string]any {
 // ---- admin portal (staff only — Section 11.1) ----
 
 func (s *Server) handleAdminListOrgs(w http.ResponseWriter, r *http.Request) {
-	orgs, err := store.ListOrgs(r.Context(), s.Store.Pool, 200)
+	// review_status filter (register §2.1): the console filters the queue.
+	var orgs []model.Org
+	var err error
+	if rs := r.URL.Query().Get("review_status"); rs != "" {
+		orgs, err = store.ListOrgsByReviewStatus(r.Context(), s.Store.Pool, rs, 200)
+	} else {
+		orgs, err = store.ListOrgs(r.Context(), s.Store.Pool, 200)
+	}
 	if err != nil {
 		mapError(w, err)
 		return
@@ -303,6 +310,120 @@ func (s *Server) handleAdminImpersonate(w http.ResponseWriter, r *http.Request) 
 		"ttl_minutes": 60,
 		"guardrails":  []string{"no credential changes", "mail-body reads audited", "banner shown in webmail"},
 	})
+}
+
+// handleAdminDeclineOrg: the review-queue decline (register §2.1) — the
+// application is refused; the org stays suspended-by-default and never sends.
+func (s *Server) handleAdminDeclineOrg(w http.ResponseWriter, r *http.Request) {
+	ac := authFrom(r.Context())
+	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Org)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad id")
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	_ = decodeJSON(r, &req)
+	err := s.Store.WithTx(r.Context(), func(tx store.Tx) error {
+		if err := store.SetOrgReviewStatus(r.Context(), tx, id, "declined"); err != nil {
+			return err
+		}
+		if err := store.SetOrgSending(r.Context(), tx, id, false, "review_declined"); err != nil {
+			return err
+		}
+		return store.RecordAudit(r.Context(), tx, nil, &ac.User.ID, false,
+			"org.decline", "org", id.String(), req.Reason, nil)
+	})
+	if err != nil {
+		mapError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "review_status": "declined"})
+}
+
+// handleAdminEndImpersonation: ends an impersonation session (register §2.2) —
+// store method existed, route was missing.
+func (s *Server) handleAdminEndImpersonation(w http.ResponseWriter, r *http.Request) {
+	ac := authFrom(r.Context())
+	sessID, ok := parseIDParam(chi.URLParam(r, "id"), ids.Session)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad session id")
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	_ = decodeJSON(r, &req)
+	if err := s.Auth.EndImpersonation(r.Context(), ac.User, sessID, req.Reason); err != nil {
+		mapError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ended": true})
+}
+
+// handleAdminResumeMailbox: clears a bounce-breaker / abuse / admin pause
+// (register §2.3) — the breaker must be operable by humans.
+func (s *Server) handleAdminResumeMailbox(w http.ResponseWriter, r *http.Request) {
+	ac := authFrom(r.Context())
+	id, ok := parseIDParam(chi.URLParam(r, "id"), ids.Mailbox)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_credentials", "bad mailbox id")
+		return
+	}
+	mb, err := store.GetMailbox(r.Context(), s.Store.Pool, id)
+	if err != nil {
+		mapError(w, err)
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	_ = decodeJSON(r, &req)
+	err = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
+		if err := store.SetMailboxSendStatus(r.Context(), tx, id, "active", ""); err != nil {
+			return err
+		}
+		return store.RecordAudit(r.Context(), tx, nil, &ac.User.ID, false,
+			"mailbox.resume", "mailbox", id.String(),
+			"was "+mb.SendStatus+"; "+req.Reason, nil)
+	})
+	if err != nil {
+		mapError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "send_status": "active"})
+}
+
+// handleAdminListSuppression: the suppression list (register §2.4), org-scoped
+// or across orgs.
+func (s *Server) handleAdminListSuppression(w http.ResponseWriter, r *http.Request) {
+	var rows []model.Suppression
+	var err error
+	if v := r.URL.Query().Get("org_id"); v != "" {
+		orgID, ok := parseIDParam(v, ids.Org)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid_credentials", "bad org_id")
+			return
+		}
+		rows, err = store.ListSuppression(r.Context(), s.Store.Pool, orgID)
+	} else {
+		rows, err = store.ListSuppressionAll(r.Context(), s.Store.Pool, 200)
+	}
+	if err != nil {
+		mapError(w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, map[string]any{
+			"org_id":     ids.Format(ids.Org, row.OrgID),
+			"email":      row.Email,
+			"reason":     row.Reason,
+			"created_at": row.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"suppression": out})
 }
 
 func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {

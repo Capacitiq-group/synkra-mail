@@ -53,11 +53,11 @@ type Addr struct {
 }
 
 type Att struct {
-	Filename    string
-	ContentType string
-	Content     []byte
-	IsInline    bool
-	ContentID   string
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Content     []byte `json:"content"`
+	IsInline    bool   `json:"is_inline"`
+	ContentID   string `json:"content_id"`
 }
 
 // Parse decodes an RFC 822 message.
