@@ -170,6 +170,9 @@ func bootStack() (*stack, error) {
 		TrackerURL:  trackerBase,
 		TrackingKey: []byte(cfg.TrackingSecret),
 	}
+	// Autoresponder hook (register §12c): ingest decides when, the pipeline
+	// sends through normal admission.
+	deps.AutoReply = pipeline.SendAutoReply
 
 	// HTTP API
 	apiSrv := &api.Server{Cfg: cfg, Auth: authSvc, Store: st, Pipeline: pipeline}

@@ -503,6 +503,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		HTML        string          `json:"html"`
 		InReplyTo   string          `json:"in_reply_to"`
 		Track       bool            `json:"track"`
+		Newsletter  bool            `json:"newsletter"`
 		Attachments []mimeutil.Att  `json:"attachments"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -533,6 +534,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		To:   req.To, Cc: req.Cc, Bcc: req.Bcc,
 		Subject: req.Subject, Text: req.Text, HTML: req.HTML,
 		InReplyTo: req.InReplyTo, Attachments: req.Attachments, Track: req.Track,
+		Newsletter: req.Newsletter,
 	}
 	msgID, recipients, err := s.Pipeline.ComposeAndQueue(r.Context(), ac.User.ID, ac.User.OrgID, in)
 	if err != nil {

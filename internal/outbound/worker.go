@@ -5,6 +5,7 @@ package outbound
 
 import (
 	"bytes"
+	"net/http"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -23,6 +24,7 @@ import (
 	"github.com/google/uuid"
 
 	"synkra.email/mail/internal/ingest"
+	"synkra.email/mail/internal/krypto"
 	"synkra.email/mail/internal/model"
 	"synkra.email/mail/internal/store"
 )
@@ -76,8 +78,10 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// Tick claims and processes one batch.
+// Tick claims and processes one batch. Webhook deliveries (§13f) go first:
+// they are small, best-effort, and never block the delivery batch.
 func (w *Worker) Tick(ctx context.Context) error {
+	w.dispatchWebhooks(ctx)
 	jobs, err := store.ClaimDueJobs(ctx, w.Pipeline.Store.Pool, w.ID, 10*time.Minute, 20)
 	if err != nil {
 		return err
@@ -196,13 +200,38 @@ func (w *Worker) completeJob(ctx context.Context, j *model.DeliveryJob, code int
 
 // recordJobEvent appends the delivery event log row inside the same
 // transaction that moves the job (register §7.3) — trace and truth stay one.
+// Webhooks subscribed to this state fan out in the same transaction (§13f).
 func recordJobEvent(ctx context.Context, tx store.Tx, j *model.DeliveryJob, state, code, msg string) error {
 	detail, _ := json.Marshal(map[string]any{"code": code, "message": msg})
 	mbID := j.MailboxID
-	return store.RecordDeliveryEvent(ctx, tx, &model.DeliveryEvent{
+	event := &model.DeliveryEvent{
 		ID: uuid.New(), MessageID: j.MessageID, OrgID: j.OrgID, MailboxID: &mbID,
 		State: state, Detail: detail,
-	})
+	}
+	if err := store.RecordDeliveryEvent(ctx, tx, event); err != nil {
+		return err
+	}
+	hooks, err := store.ActiveWebhooksForEvent(ctx, tx, j.OrgID, state)
+	if err != nil {
+		return err
+	}
+	for _, h := range hooks {
+		payload, _ := json.Marshal(map[string]any{
+			"event":      state,
+			"message_id": j.MessageID,
+			"org_id":     j.OrgID,
+			"mailbox_id": j.MailboxID,
+			"rcpt":       j.EnvelopeTo,
+			"code":       code,
+			"message":    msg,
+		})
+		if err := store.QueueWebhookDelivery(ctx, tx, &store.WebhookDelivery{
+			ID: uuid.New(), WebhookID: h.ID, EventID: event.ID, Payload: payload,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *Worker) deferJob(ctx context.Context, j *model.DeliveryJob, attempts int, fixedDelay time.Duration, code, msg string) error {
@@ -614,3 +643,52 @@ func hostOnly(hostport string) string {
 	}
 	return hostport
 }
+
+// dispatchWebhooks POSTs due webhook deliveries with an HMAC signature
+// (X-Synkra-Signature over the raw body). 2xx counts as delivered; failures
+// retry with backoff and are dropped after 5 attempts.
+func (w *Worker) dispatchWebhooks(ctx context.Context) {
+	claims, err := store.ClaimDueWebhookDeliveries(ctx, w.Pipeline.Store.Pool, 10)
+	if err != nil {
+		log.Printf("[worker] webhook claim: %v", err)
+		return
+	}
+	for i := range claims {
+		c := &claims[i]
+		hook, err := store.GetWebhookByID(ctx, w.Pipeline.Store.Pool, c.WebhookID)
+		if err != nil {
+			_ = w.Pipeline.Store.WithTx(ctx, func(tx store.Tx) error {
+				return store.SetWebhookDeliveryOutcome(ctx, tx, c.ID, false, "webhook deleted")
+			})
+			continue
+		}
+		ok, lastErr := postWebhook(ctx, hook.URL, hook.Secret, c.Payload)
+		if err := w.Pipeline.Store.WithTx(ctx, func(tx store.Tx) error {
+			return store.SetWebhookDeliveryOutcome(ctx, tx, c.ID, ok, lastErr)
+		}); err != nil {
+			log.Printf("[worker] webhook outcome: %v", err)
+		}
+	}
+}
+
+func postWebhook(ctx context.Context, url, secret string, body []byte) (bool, string) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return false, err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Synkra-Signature", "sha256="+krypto.HMACSign([]byte(secret), string(body)))
+	resp, err := webhookClient.Do(req)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return true, ""
+	}
+	return false, "http " + resp.Status
+}
+
+var webhookClient = &http.Client{Timeout: 10 * time.Second}

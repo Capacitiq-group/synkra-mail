@@ -176,6 +176,11 @@ type ComposeInput struct {
 	// MessageIDDomain is the domain of the minted Message-ID. Empty: derived
 	// from the From address's domain; no domain there either: "localhost".
 	MessageIDDomain string
+
+	// ListUnsubscribe / ListID: RFC 2369 + RFC 2919 headers for bulk mail
+	// (register §12e). Empty: no header.
+	ListUnsubscribe string
+	ListID          string
 }
 
 // Build renders an RFC 822 message (quoted-printable text, multipart when
@@ -210,6 +215,14 @@ func Build(in ComposeInput) (raw []byte, messageID string, err error) {
 		h.Set("References", strings.Join(refs, " "))
 	}
 	h.Set("X-Mailer", "Synkra-Email/1.0")
+	if in.ListUnsubscribe != "" {
+		// RFC 2369 one-click for the one-click methods (RFC 8058).
+		h.Set("List-Unsubscribe", in.ListUnsubscribe)
+		h.Set("List-Unsubscribe-Post", "List-Unsubscribe=One-Click")
+	}
+	if in.ListID != "" {
+		h.Set("List-Id", in.ListID)
+	}
 
 	hasAttachments := false
 	for _, a := range in.Attachments {

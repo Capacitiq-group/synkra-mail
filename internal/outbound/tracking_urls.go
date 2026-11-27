@@ -38,6 +38,38 @@ func VerifyClickSig(key []byte, linkID, target, sig string) bool {
 	return krypto.HMACVerify(key, "c|"+linkID+"|"+target, sig)
 }
 
+// UnsubscribeURL: https://trk.../u/{b64(payload)}?s={sig} with the payload
+// "u|org|mailbox|rcpt" (register §12e, one-click). The HMAC keeps the endpoint
+// un-guessable; the recipient rides inside the signature.
+func UnsubscribeURL(trackerURL string, key []byte, orgID, mailboxID uuid.UUID, rcpt string) string {
+	payload := "u|" + orgID.String() + "|" + mailboxID.String() + "|" + rcpt
+	sig := krypto.HMACSign(key, payload)
+	return fmt.Sprintf("%s/u/%s?s=%s", strings.TrimRight(trackerURL, "/"),
+		base64.RawURLEncoding.EncodeToString([]byte(payload)), sig)
+}
+
+// VerifyUnsubscribeSig parses and verifies an unsubscribe token; returns the
+// org id, mailbox id and recipient it carries.
+func VerifyUnsubscribeSig(key []byte, token, sig string) (orgID, mailboxID uuid.UUID, rcpt string, ok bool) {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || !krypto.HMACVerify(key, string(raw), sig) {
+		return uuid.Nil, uuid.Nil, "", false
+	}
+	parts := strings.Split(string(raw), "|")
+	if len(parts) != 4 || parts[0] != "u" {
+		return uuid.Nil, uuid.Nil, "", false
+	}
+	orgID, err = uuid.Parse(parts[1])
+	if err != nil {
+		return uuid.Nil, uuid.Nil, "", false
+	}
+	mailboxID, err = uuid.Parse(parts[2])
+	if err != nil {
+		return uuid.Nil, uuid.Nil, "", false
+	}
+	return orgID, mailboxID, parts[3], true
+}
+
 // RewriteLinks rewrites hrefs in HTML through the click tracker. The callback
 // returns the tracked URL for a target.
 var hrefRe = regexp.MustCompile(`(?i)href\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s>]+)`)

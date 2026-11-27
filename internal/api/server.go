@@ -65,6 +65,31 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/messages/{id}/attachments", s.handleListAttachments)
 			r.Get("/messages/{id}/attachments/{att_id}", s.handleGetAttachment)
 
+			// Feature register §12: signatures, autoresponder, routing rules,
+			// mail trace, deliverability dashboard.
+			r.Get("/me/signatures", s.handleListSignatures)
+			r.Post("/me/signatures", s.handleCreateSignature)
+			r.Delete("/me/signatures/{id}", s.handleDeleteSignature)
+			r.Get("/mailboxes/{id}/autoresponder", s.handleGetAutoresponder)
+			r.Put("/mailboxes/{id}/autoresponder", s.handleSetAutoresponder)
+			r.Get("/mailboxes/{id}/rules", s.handleListRules)
+			r.Post("/mailboxes/{id}/rules", s.handleCreateRule)
+			r.Delete("/mailboxes/{id}/rules/{rid}", s.handleDeleteRule)
+			r.Get("/messages/{id}/trace", s.handleMessageTrace)
+			r.Get("/org/deliverability", s.handleOrgDeliverability)
+
+			// Differentiators §13: health score, reliability monitor, webhooks,
+			// API keys (the API is the product).
+			r.Get("/org/health", s.handleOrgHealth)
+			r.Get("/org/reliability", s.handleOrgReliability)
+			r.Get("/org/webhooks", s.handleListWebhooks)
+			r.Post("/org/webhooks", s.handleCreateWebhook)
+			r.Delete("/org/webhooks/{id}", s.handleDeleteWebhook)
+			r.Post("/org/webhooks/{id}/test", s.handleTestWebhook)
+			r.Get("/org/api-keys", s.handleListAPIKeys)
+			r.Post("/org/api-keys", s.handleCreateAPIKey)
+			r.Delete("/org/api-keys/{id}", s.handleRevokeAPIKey)
+
 			r.Get("/app-passwords", s.handleListAppPasswords)
 			r.Post("/app-passwords", s.handleCreateAppPassword)
 			r.Delete("/app-passwords/{id}", s.handleRevokeAppPassword)
@@ -148,6 +173,13 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 			return
 		}
 		ac, err := s.Auth.VerifyToken(r.Context(), token)
+		if err != nil {
+			// API keys (register §13f): sk_ tokens authenticate machine access
+			// through the same middleware and tenancy checks.
+			if akac, aerr := s.Auth.AuthenticateAPIKey(r.Context(), token); aerr == nil {
+				ac, err = akac, nil
+			}
+		}
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid or expired session")
 			return
@@ -260,6 +292,8 @@ func mapError(w http.ResponseWriter, err error) {
 		writeErrorHint(w, http.StatusConflict, "ambiguous_login", err.Error(),
 			"this login e-mail exists in more than one organisation; use the full mailbox address of your organisation or contact support")
 	case errors.Is(err, authn.ErrStaffImpersonation):
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+	case errors.Is(err, authn.ErrCredentialChangeNotAllowed):
 		writeError(w, http.StatusForbidden, "forbidden", err.Error())
 	case errors.Is(err, authn.ErrAppPasswordLimit):
 		writeError(w, http.StatusBadRequest, "limit_exceeded", err.Error())

@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,7 +27,10 @@ const (
 )
 
 type Deps struct {
-	Store *store.Store
+	Store    *store.Store
+	// AutoReply sends the mailbox's autoresponder message (register §12c).
+	// Wired to the outbound pipeline; ingest decides WHEN, not HOW.
+	AutoReply func(ctx context.Context, mailboxID, orgID uuid.UUID, to, inSubject string) error
 	Blobs blob.Store
 	Cfg   *config.Config
 }
@@ -235,9 +240,27 @@ func (d *Deps) storeMessage(ctx context.Context, raw []byte, envFrom string, mb 
 		return nil, &SMTPError{Code: 451, Message: "4.3.0 storage failed"}
 	}
 
-	folder, err := store.GetFolderBySpecialUse(ctx, d.Store.Pool, mb.ID, folderSpecial)
-	if err != nil {
-		return nil, &SMTPError{Code: 451, Message: "4.3.0 folder lookup failed"}
+	// Inbound routing rules (register §12d): first match in position order
+	// overrides the destination folder. System injections (null envelope path)
+	// skip the rule engine.
+	var rule *store.MailboxRule
+	if envFrom != "" {
+		if r, rerr := store.FirstMatchingRule(ctx, d.Store.Pool, mb.ID, parsed.FromEmail, parsed.Subject); rerr == nil && r != nil {
+			rule = r
+			log.Printf("[ingest] rule %s matched for mailbox %s", r.ID, mb.ID)
+		}
+	}
+	var folder *model.Folder
+	if rule != nil && rule.ActionFolderID != nil {
+		folder, err = store.GetFolder(ctx, d.Store.Pool, *rule.ActionFolderID)
+		if err != nil {
+			return nil, &SMTPError{Code: 451, Message: "4.3.0 rule folder lookup failed"}
+		}
+	} else {
+		folder, err = store.GetFolderBySpecialUse(ctx, d.Store.Pool, mb.ID, folderSpecial)
+		if err != nil {
+			return nil, &SMTPError{Code: 451, Message: "4.3.0 folder lookup failed"}
+		}
 	}
 
 	msgID := uuid.New()
@@ -272,6 +295,10 @@ func (d *Deps) storeMessage(ctx context.Context, raw []byte, envFrom string, mb 
 		SpamScore:      float32(score),
 	}
 
+	flags := []string(nil)
+	if rule != nil && rule.ActionMarkRead {
+		flags = append(flags, model.FlagSeen)
+	}
 	var uid uint32
 	err = d.Store.WithTx(ctx, func(tx store.Tx) error {
 		subjNorm := mimeutil.NormalizeSubject(parsed.Subject)
@@ -280,7 +307,7 @@ func (d *Deps) storeMessage(ctx context.Context, raw []byte, envFrom string, mb 
 			return terr
 		}
 		msg.ThreadID = &threadID
-		_, uid, err = store.InsertMessage(ctx, tx, msg, folder.ID, nil)
+		_, uid, err = store.InsertMessage(ctx, tx, msg, folder.ID, flags)
 		if err != nil {
 			return err
 		}
@@ -302,7 +329,46 @@ func (d *Deps) storeMessage(ctx context.Context, raw []byte, envFrom string, mb 
 	if err != nil {
 		return nil, &SMTPError{Code: 451, Message: "4.3.0 store failed"}
 	}
+	// Autoresponder (register §12c): window + one-reply-per-sender-per-day
+	// guards run here; the reply itself goes out through the wired sender.
+	if d.AutoReply != nil && envFrom != "" && folder.SpecialUse == model.FolderInbox &&
+		!isDaemonPath(envFrom) {
+		log.Printf("[ingest] autoresponder check for mailbox %s from %s", mb.ID, logDomain(envFrom))
+		if ok, _ := store.ShouldAutoReply(ctx, d.Store.Pool, mb.ID, time.Now(), envFrom); ok {
+			if cerr := d.Store.WithTx(ctx, func(tx store.Tx) error {
+				return store.RecordAutoReply(ctx, tx, mb.ID, envFrom)
+			}); cerr == nil {
+				if aerr := d.AutoReply(ctx, mb.ID, mb.OrgID, envFrom, parsed.Subject); aerr != nil {
+					log.Printf("[ingest] auto-reply to %s: %v", envFrom, aerr)
+				}
+			}
+		}
+	}
 	return &Result{MessageID: msgID, MailboxID: mb.ID, FolderID: folder.ID, UID: uid, SpamScore: score}, nil
+}
+
+// isDaemonPath: never reply to the null-path cousins (DSNs arrive with an empty
+// envelope from and are skipped earlier; these are the machine senders).
+// logDomain: the sender's domain for logs (no local part, no content).
+func logDomain(addr string) string {
+	if i := strings.LastIndexByte(addr, '@'); i >= 0 {
+		return addr[i+1:]
+	}
+	return "(unknown)"
+}
+
+func isDaemonPath(envFrom string) bool {
+	local := envFrom
+	if i := strings.IndexByte(envFrom, '@'); i >= 0 {
+		local = envFrom[:i]
+	}
+	local = strings.ToLower(local)
+	for _, d := range []string{"postmaster", "mailer-daemon", "noreply", "no-reply", "donotreply", "bounce", "bounces", "auto"} {
+		if local == d || strings.HasPrefix(local, d) {
+			return true
+		}
+	}
+	return false
 }
 
 // Score is the v1 rule engine (auth results + heuristics — Section 7.2),

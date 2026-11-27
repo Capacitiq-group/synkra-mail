@@ -40,6 +40,10 @@ const (
 	Audit       = "aud"
 	RateEvent   = "rat"
 	Ledger      = "led"
+	Signature   = "sig"
+	Rule        = "rul"
+	Webhook     = "whk"
+	APIKey      = "key"
 )
 
 var lastMu sync.Mutex

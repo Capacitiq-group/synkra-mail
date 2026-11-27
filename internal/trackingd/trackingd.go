@@ -12,6 +12,7 @@
 package trackingd
 
 import (
+	"github.com/google/uuid"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -49,6 +50,8 @@ func (s *Service) Routes() http.Handler {
 	r.Get("/o/{pixel}.gif", s.handleOpen)
 	r.Get("/o/{pixel}", s.handleOpen)
 	r.Get("/c/{link}", s.handleClick)
+	r.Get("/u/{token}", s.handleUnsubscribe)
+	r.Post("/u/{token}", s.handleUnsubscribe)
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte("ok"))
@@ -92,6 +95,48 @@ func (s *Service) handleClick(w http.ResponseWriter, r *http.Request) {
 	}
 	go s.postEvent("click", link, clientFamily(r.UserAgent()), ipHash(r))
 	http.Redirect(w, r, t, http.StatusFound)
+}
+
+// handleUnsubscribe: one-click list unsubscribe (register §12e). The token is
+// HMAC-signed by the core; the tracker verifies and forwards without holding
+// database credentials, then answers with a plain HTML page.
+func (s *Service) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	token := chi.URLParam(r, "token")
+	sig := r.URL.Query().Get("s")
+	orgID, mailboxID, rcpt, ok := outbound.VerifyUnsubscribeSig(s.Secret, token, sig)
+	if !ok {
+		http.Error(w, "bad signature", http.StatusForbidden)
+		return
+	}
+	go s.postUnsubscribe(orgID, mailboxID, rcpt)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte("<!doctype html><html><head><meta charset=\"utf-8\"><title>Unsubscribed</title></head>" +
+		"<body style=\"font-family:sans-serif;max-width:28rem;margin:4rem auto\">" +
+		"<h1>Unsubscribed</h1><p>This address has been removed from the mailing list. " +
+		"We are sorry to see you go.</p></body></html>"))
+}
+
+func (s *Service) postUnsubscribe(orgID, mailboxID uuid.UUID, rcpt string) {
+	payload := map[string]any{
+		"kind":      "unsubscribe",
+		"org_id":    orgID.String(),
+		"mailbox_id": mailboxID.String(),
+		"rcpt":      rcpt,
+	}
+	body, _ := json.Marshal(payload)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.CoreInternalURL, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Synkra-Tracker-Signature", krypto.HMACSign([]byte(s.Secret), string(body)))
+	resp, err := s.HTTP.Do(req)
+	if err != nil {
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 // postEvent signs and posts the event to the core internal endpoint.

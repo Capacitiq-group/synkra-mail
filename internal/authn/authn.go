@@ -29,6 +29,9 @@ var (
 	// ErrStaffImpersonation: staff accounts cannot be impersonated (register §1.7) —
 	// the audit log alone is not a privilege boundary.
 	ErrStaffImpersonation = errors.New("staff accounts cannot be impersonated")
+	// ErrCredentialChangeNotAllowed: impersonated sessions and API-key contexts
+	// manage credentials only through the reset flow.
+	ErrCredentialChangeNotAllowed = errors.New("this session cannot change credentials")
 )
 
 // AuthContext is resolved from a verified session/token — never from client
@@ -44,9 +47,12 @@ func (a *AuthContext) Impersonating() bool {
 	return a.Session != nil && a.Session.Kind == "impersonation"
 }
 
-// CanChangeCredentials: impersonated sessions cannot change credentials
-// (Section 11.2 — credential operations use the reset flow instead).
+// CanChangeCredentials: impersonated sessions and API-key contexts cannot
+// change credentials (Section 11.2 — credential operations use the reset flow).
 func (a *AuthContext) CanChangeCredentials() bool {
+	if a.Session != nil && a.Session.Kind == "api_key" {
+		return false
+	}
 	return !a.Impersonating()
 }
 
@@ -273,7 +279,7 @@ func (s *Service) RevokeAppPassword(ctx context.Context, ac *AuthContext, apID u
 // the user. Impersonated sessions cannot change credentials (Section 11.2).
 func (s *Service) ChangeOwnPassword(ctx context.Context, ac *AuthContext, current, next string) error {
 	if !ac.CanChangeCredentials() {
-		return errors.New("impersonated sessions cannot manage credentials")
+		return ErrCredentialChangeNotAllowed
 	}
 	if len(next) < 8 {
 		return errors.New("new password must be at least 8 characters")
@@ -393,3 +399,62 @@ func splitAddress(addr string) (local, domain string, err error) {
 }
 
 func stringsEqualFold(a, b string) bool { return strings.EqualFold(a, b) }
+
+// ---- API keys (register §13f: the API is the product) ----
+
+// CreateAPIKey mints sk_<8hex>_<secret>; the secret is shown exactly once.
+func (s *Service) CreateAPIKey(ctx context.Context, ac *AuthContext, name string, ttl time.Duration) (string, *store.APIKey, error) {
+	if ac.Session != nil && (ac.Session.Kind == "impersonation" || ac.Session.Kind == "api_key") {
+		return "", nil, ErrImpersonationDenied
+	}
+	secret := krypto.NewToken()
+	prefix8 := secret[:8]
+	token := "sk_" + prefix8 + "_" + secret
+	k := &store.APIKey{
+		ID: uuid.New(), OrgID: ac.User.OrgID, CreatedBy: ac.User.ID,
+		Name: name, TokenHash: krypto.SHA256Hex(token), Prefix: "sk_" + prefix8,
+	}
+	if ttl > 0 {
+		exp := time.Now().Add(ttl)
+		k.ExpiresAt = &exp
+	}
+	err := s.Store.WithTx(ctx, func(tx store.Tx) error {
+		if err := store.CreateAPIKey(ctx, tx, k); err != nil {
+			return err
+		}
+		return store.RecordAudit(ctx, tx, &ac.User.ID, nil, false, "api_key.create", "api_key", k.ID.String(), name, nil)
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	return token, k, nil
+}
+
+// AuthenticateAPIKey resolves an sk_ token to an auth context. The acting user
+// is the key's creator; the org scopes everything as usual.
+func (s *Service) AuthenticateAPIKey(ctx context.Context, token string) (*AuthContext, error) {
+	token = strings.TrimSpace(token)
+	if !strings.HasPrefix(token, "sk_") {
+		return nil, ErrInvalidCredentials
+	}
+	k, err := store.GetAPIKeyByTokenHash(ctx, s.Store.Pool, krypto.SHA256Hex(token))
+	if err != nil {
+		return nil, ErrInvalidCredentials
+	}
+	if k.RevokedAt != nil || (k.ExpiresAt != nil && time.Now().After(*k.ExpiresAt)) {
+		return nil, ErrInvalidCredentials
+	}
+	u, err := store.GetUser(ctx, s.Store.Pool, k.CreatedBy)
+	if err != nil || u.Status != "active" {
+		return nil, ErrInvalidCredentials
+	}
+	org, err := store.GetOrg(ctx, s.Store.Pool, k.OrgID)
+	if err != nil {
+		return nil, err
+	}
+	_ = s.Store.WithTx(ctx, func(tx store.Tx) error {
+		return store.TouchAPIKey(ctx, tx, k.ID)
+	})
+	return &AuthContext{User: u, Org: org,
+		Session: &model.Session{ID: uuid.New(), Kind: "api_key"}}, nil
+}

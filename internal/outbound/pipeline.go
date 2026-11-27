@@ -63,8 +63,11 @@ type ComposeInput struct {
 	References  []string
 	Attachments []mimeutil.Att
 	// Date is the submission time (InternalDate of the Sent copy); zero = now.
-	Date  time.Time
-	Track bool // per-message opt-in (compose UI shows a disclosure — Section 9.4)
+	Date            time.Time
+	Track           bool // per-message opt-in (compose UI shows a disclosure — Section 9.4)
+	Newsletter      bool // RFC 2369 bulk mail: adds List-Unsubscribe (register §12e)
+	ListUnsubscribe string
+	ListID          string
 }
 
 // RecipientView is the API response: what happened per recipient.
@@ -192,6 +195,17 @@ func (p *Pipeline) QueueSubmission(ctx context.Context, userID, orgID uuid.UUID,
 
 // admissionAndBuild: sending state, limits, suppression, tracking rewrite, MIME build.
 func (p *Pipeline) admissionAndBuild(ctx context.Context, fromMailbox *model.Mailbox, in ComposeInput) (*admitted, error) {
+	// List-Unsubscribe (register §12e): one-click for bulk mail. The token is
+	// per recipient; with several recipients the header cannot name them all,
+	// so bulk sends to a single recipient carry it (a newsletter to a list is
+	// one send per recipient anyway) and batch sends carry none.
+	if in.Newsletter {
+		if rcpts := gatherRecipients(in); len(rcpts) == 1 {
+			in.ListUnsubscribe = UnsubscribeURL(p.TrackerURL, p.TrackingKey, fromMailbox.OrgID, fromMailbox.ID, rcpts[0])
+			in.ListID = "<" + strings.ToLower(strings.ReplaceAll(fromMailbox.Name, " ", "-")) +
+				"." + fromMailbox.OrgID.String()[:8] + "@" + p.Cfg.Hostname + ">"
+		}
+	}
 	org, err := store.GetOrg(ctx, p.Store.Pool, fromMailbox.OrgID)
 	if err != nil {
 		return nil, err
@@ -331,12 +345,55 @@ func (p *Pipeline) checkLimits(ctx context.Context, org *model.Org, fromMailbox 
 	return nil
 }
 
+// SendAutoReply is the ingest hook target (register §12c): ingest decides WHEN
+// (window, rate limit, daemon guard); this builds and queues the reply through
+// the normal admission path, so a suspended or blocked org simply stays quiet.
+func (p *Pipeline) SendAutoReply(ctx context.Context, mailboxID, orgID uuid.UUID, to, inSubject string) error {
+	ar, err := store.GetAutoresponder(ctx, p.Store.Pool, mailboxID)
+	if err != nil || !ar.Enabled || ar.Body == "" {
+		return nil
+	}
+	from, err := store.GetPrimaryAddressByMailbox(ctx, p.Store.Pool, mailboxID)
+	if err != nil {
+		return err
+	}
+	mb, err := store.GetMailbox(ctx, p.Store.Pool, mailboxID)
+	if err != nil {
+		return err
+	}
+	var fromName string
+	if mb.OwnerUserID == nil {
+		fromName = mb.Name
+	}
+	subject := ar.Subject
+	if subject == "" {
+		subject = "Re: " + inSubject
+	}
+	in := ComposeInput{
+		From: mimeutil.Addr{Email: from, Name: fromName},
+		To:   []mimeutil.Addr{{Email: to}},
+		Subject: subject, Text: ar.Body,
+	}
+	userID := uuid.Nil
+	if mb.OwnerUserID != nil {
+		userID = *mb.OwnerUserID
+	} else {
+		userID, err = store.GetOrgOwnerID(ctx, p.Store.Pool, orgID)
+		if err != nil {
+			return err
+		}
+	}
+	_, _, err = p.ComposeAndQueue(ctx, userID, orgID, in)
+	return err
+}
+
 func (p *Pipeline) build(in ComposeInput) ([]byte, string, error) {
 	return mimeutil.Build(mimeutil.ComposeInput{
 		From: in.From, To: in.To, Cc: in.Cc, Bcc: in.Bcc, Subject: in.Subject,
 		Text: in.Text, HTML: in.HTML, InReplyTo: in.InReplyTo, References: in.References,
 		Attachments: in.Attachments, Date: in.Date,
 		MessageIDDomain: p.Cfg.Hostname,
+		ListUnsubscribe: in.ListUnsubscribe, ListID: in.ListID,
 	})
 }
 
@@ -349,6 +406,7 @@ func (p *Pipeline) buildTracked(ctx context.Context, org *model.Org, fromMailbox
 		Text: in.Text, HTML: in.HTML, InReplyTo: in.InReplyTo, References: in.References,
 		Attachments: in.Attachments, Date: in.Date,
 		MessageIDDomain: p.Cfg.Hostname,
+		ListUnsubscribe: in.ListUnsubscribe, ListID: in.ListID,
 	})
 	if err != nil {
 		return nil, "", nil, err

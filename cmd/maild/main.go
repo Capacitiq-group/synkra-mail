@@ -96,10 +96,8 @@ func main() {
 	}()
 
 	authSvc := &authn.Service{Store: st, Cfg: cfg}
-	deps := &ingest.Deps{Store: st, Blobs: blobStore, Cfg: cfg}
-
 	pipeline := &outbound.Pipeline{
-		Store: st, Blobs: blobStore, Cfg: cfg, Deps: deps,
+		Store: st, Blobs: blobStore, Cfg: cfg,
 		TrackEnabled: func(ctx context.Context, orgID uuid.UUID) bool {
 			org, err := store.GetOrg(ctx, st.Pool, orgID)
 			return err == nil && org.TrackingEnabled
@@ -107,6 +105,11 @@ func main() {
 		TrackerURL:  cfg.TrackerURL,
 		TrackingKey: []byte(cfg.TrackingSecret),
 	}
+	// Autoresponder hook (register §12c): ingest decides when, the pipeline
+	// sends through normal admission.
+	pipeline.Deps = &ingest.Deps{Store: st, Blobs: blobStore, Cfg: cfg,
+		AutoReply: pipeline.SendAutoReply}
+	deps := pipeline.Deps
 
 	if *seed {
 		if err := bootstrap(ctx, cfg, st); err != nil {

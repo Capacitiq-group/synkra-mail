@@ -21,7 +21,10 @@ import (
 )
 
 type internalEventReq struct {
-	Kind         string    `json:"kind"` // open | click
+		OrgID      string    `json:"org_id,omitempty"`
+		MailboxID  string    `json:"mailbox_id,omitempty"`
+		Rcpt       string    `json:"rcpt,omitempty"`
+	Kind         string    `json:"kind"` // open | click | unsubscribe
 	ID           string    `json:"id"`   // pixel id or link id
 	OccurredAt   time.Time `json:"occurred_at"`
 	ClientFamily string    `json:"client_family"`
@@ -100,8 +103,31 @@ func (s *Server) handleInternalTrackingEvent(w http.ResponseWriter, r *http.Requ
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "target": link.URL})
 
+	case "unsubscribe":
+		orgID, ok := parseIDParam(req.OrgID, ids.Org)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid_credentials", "bad org id")
+			return
+		}
+		if req.Rcpt == "" {
+			writeError(w, http.StatusBadRequest, "invalid_credentials", "rcpt required")
+			return
+		}
+		err = s.Store.WithTx(r.Context(), func(tx store.Tx) error {
+			if err := store.Suppress(r.Context(), tx, orgID, req.Rcpt, "unsubscribe"); err != nil {
+				return err
+			}
+			return store.RecordAudit(r.Context(), tx, nil, nil, false,
+				"unsubscribe", "org", orgID.String(), req.Rcpt, nil)
+		})
+		if err != nil {
+			mapError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "unsubscribed": req.Rcpt})
+
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_credentials", "kind must be open|click")
+		writeError(w, http.StatusBadRequest, "invalid_credentials", "kind must be open|click|unsubscribe")
 	}
 }
 
