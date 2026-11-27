@@ -859,6 +859,15 @@ func (s *Server) handleListAddresses(w http.ResponseWriter, r *http.Request) {
 	for _, d := range domains {
 		domName[d.ID] = d.Name
 	}
+	// The platform domain (org_id NULL) hosts every tenant's primary address —
+	// it is not in the org-scoped list, so fetch it explicitly or user
+	// addresses render as "local@" (bug surfaced by the seeded webmail demo).
+	var platformDomain model.Domain
+	if err := s.Store.Pool.QueryRow(r.Context(),
+		`select id, name from mail.domain where is_platform and org_id is null limit 1`,
+	).Scan(&platformDomain.ID, &platformDomain.Name); err == nil {
+		domName[platformDomain.ID] = platformDomain.Name
+	}
 	out := make([]map[string]any, 0, len(addrs))
 	for _, a := range addrs {
 		out = append(out, map[string]any{

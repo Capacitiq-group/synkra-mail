@@ -1,11 +1,7 @@
-import type { MessageView } from '@/types/api'
-
-/**
- * Client-side spoof & phishing heuristics (catalog Part 2: "spoofing &
- * security alerts"). These are ADVISORY signals rendered as banners in the
- * reading pane — never a verdict. The authoritative signals are the
- * SPF/DKIM/DMARC results the backend stores per message.
- */
+// Client-side spoof & phishing heuristics for the reading pane (catalog part
+// 2: "spoofing & security alerts"). Advisory signals — never a verdict. The
+// authoritative signal is the auth_results map the ingest pipeline stores.
+import type { MessageSummary } from './types'
 
 export type Severity = 'high' | 'medium' | 'low'
 
@@ -27,13 +23,12 @@ const BRAND_DOMAINS: { brand: string; domains: string[] }[] = [
 ]
 
 /** NFKD skeleton: fold confusables/accents so homoglyph tricks collapse. */
-function skeleton(domain: string): string {
-  const folded = domain
+function skeleton(s: string): string {
+  return s
     .normalize('NFKD')
     .replace(/[̀-ͯ]/g, '')
     .toLowerCase()
-  // common confusable substitutions seen in phishing kits
-  return folded
+    .replace(/-/g, '')
     .replace(/0/g, 'o')
     .replace(/1|l/g, 'l')
     .replace(/3/g, 'e')
@@ -44,54 +39,45 @@ function skeleton(domain: string): string {
     .replace(/vv/g, 'w')
 }
 
+/** First label of the registrable domain: 'fnb-secure' from 'fnb-secure.co.za'.
+ *  Handles two-level public suffixes (co.za, org.uk, com.au, …). */
+const SECOND_LEVEL_SUFFIXES = ['co', 'org', 'net', 'gov', 'ac', 'com']
+function firstLabel(domain: string): string {
+  const parts = domain.split('.')
+  if (parts.length >= 3) {
+    const penultimate = parts[parts.length - 2]
+    const tld = parts[parts.length - 1]
+    if (SECOND_LEVEL_SUFFIXES.includes(penultimate) && tld.length === 2) {
+      return parts[parts.length - 3]
+    }
+  }
+  return parts.length >= 2 ? parts[parts.length - 2] : domain
+}
+
 function domainOf(email: string): string {
   return (email.split('@')[1] ?? '').toLowerCase()
 }
 
-export function authResultsStatus(authResults: Record<string, unknown> | null): {
-  spf: string
-  dkim: string
-  dmarc: string
-} {
-  const pick = (k: string): string => {
-    const v = authResults?.[k]
-    if (typeof v === 'string') return v.toLowerCase()
-    if (v && typeof v === 'object') {
-      const rec = v as Record<string, unknown>
-      const r = rec.result ?? rec.status ?? rec.value
-      if (typeof r === 'string') return r.toLowerCase()
-    }
-    return 'unknown'
-  }
-  return { spf: pick('spf'), dkim: pick('dkim'), dmarc: pick('dmarc') }
-}
-
-export function analyzeMessage(m: MessageView): SpoofAlert[] {
+export function analyzeMessage(m: MessageSummary): SpoofAlert[] {
   const alerts: SpoofAlert[] = []
 
-  // 1. Authentication results (authoritative, from the ingest pipeline)
-  const ar = authResultsStatus(m.auth_results)
-  if (ar.dmarc === 'fail') {
+  // 1. Authentication failures (authoritative, from the ingest pipeline)
+  const ar = m.auth_results
+  if (ar && (ar.dmarc === 'fail' || (ar.spf === 'fail' && ar.dkim === 'fail'))) {
     alerts.push({
       severity: 'high',
-      title: 'DMARC failed',
-      detail: `This message did not pass the sender domain's DMARC policy. Combined with the sender below, treat links and attachments as hostile.`,
+      title: 'Sender authentication failed',
+      detail: `SPF: ${ar.spf}, DKIM: ${ar.dkim}, DMARC: ${ar.dmarc}. The message did not pass the sender domain's own authentication — treat links and attachments as hostile.`,
     })
-  } else if (ar.spf === 'fail' && ar.dkim === 'fail') {
-    alerts.push({
-      severity: 'high',
-      title: 'SPF and DKIM both failed',
-      detail: 'Neither SPF nor DKIM validated for this message — the sender was not authenticated by its own domain.',
-    })
-  } else if (ar.spf === 'fail' || ar.dkim === 'fail') {
+  } else if (ar && (ar.spf === 'fail' || ar.dkim === 'fail')) {
     alerts.push({
       severity: 'medium',
-      title: `${ar.spf === 'fail' ? 'SPF' : 'DKIM'} failed`,
-      detail: 'One authentication mechanism failed. Verify the sender before acting on this message.',
+      title: 'Partial authentication failure',
+      detail: `SPF: ${ar.spf}, DKIM: ${ar.dkim}, DMARC: ${ar.dmarc}. Verify the sender before acting on this message.`,
     })
   }
 
-  // 2. Display-name claims an email address that differs from the real sender
+  // 2. Display name claims an address that differs from the real sender
   const displayName = m.from.name ?? ''
   const claimed = displayName.match(/[\w.+-]+@[\w.-]+\.\w+/)
   if (claimed && claimed[0].toLowerCase() !== m.from.email.toLowerCase()) {
@@ -102,12 +88,20 @@ export function analyzeMessage(m: MessageView): SpoofAlert[] {
     })
   }
 
-  // 3. Brand lookalikes in the sender domain (skeleton match, wrong domain)
+  // 3. Brand lookalikes: compare collapsed registrable labels
+  // ('fnb-secure' ≈ 'fnb') so typosquats and dash-sandwiches both trip.
   const actual = domainOf(m.from.email)
+  const actualBrand = skeleton(firstLabel(actual))
   for (const b of BRAND_DOMAINS) {
     if (b.domains.includes(actual)) break
     for (const d of b.domains) {
-      if (actual && d !== actual && skeleton(actual) === skeleton(d)) {
+      const brandLabel = skeleton(firstLabel(d))
+      const lookalike =
+        (actualBrand !== '' &&
+          actualBrand !== brandLabel &&
+          (actualBrand.includes(brandLabel) || brandLabel.includes(actualBrand))) ||
+        (actual !== '' && actual !== d && skeleton(actual) === skeleton(d))
+      if (lookalike) {
         alerts.push({
           severity: 'high',
           title: 'Lookalike sender domain',
@@ -118,18 +112,18 @@ export function analyzeMessage(m: MessageView): SpoofAlert[] {
     }
   }
 
-  // 4. High spam score (backend classifier, ingest pipeline)
-  if (m.spam_score >= 8) {
+  // 4. High spam score (backend classifier)
+  if ((m.spam_score ?? 0) >= 8) {
     alerts.push({
       severity: 'high',
       title: 'High spam score',
-      detail: `The spam classifier scored this message ${m.spam_score.toFixed(1)} / 10.`,
+      detail: `The spam classifier scored this message ${(m.spam_score ?? 0).toFixed(1)} / 10.`,
     })
-  } else if (m.spam_score >= 5) {
+  } else if ((m.spam_score ?? 0) >= 5) {
     alerts.push({
       severity: 'medium',
       title: 'Elevated spam score',
-      detail: `The spam classifier scored this message ${m.spam_score.toFixed(1)} / 10.`,
+      detail: `The spam classifier scored this message ${(m.spam_score ?? 0).toFixed(1)} / 10.`,
     })
   }
 

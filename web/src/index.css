@@ -2,29 +2,73 @@
 @tailwind components;
 @tailwind utilities;
 
-html,
-body,
-#root {
-  height: 100%;
+:root {
+  --canvas: 248 250 252;
+  --surface: 255 255 255;
+  --surface-raised: 255 255 255;
+  --ink: 15 23 42;
+  --ink-soft: 71 85 105;
+  --ink-mute: 148 163 184;
+  --line: 226 232 240;
+  --accent: 15 118 110;
+  --accent-hover: 17 94 89;
+  --accent-soft: 204 251 241;
+  --danger: 220 38 38;
+  --danger-soft: 254 226 226;
+  --warning: 217 119 6;
+  --warning-soft: 254 243 199;
+  --success: 5 150 105;
+  --success-soft: 209 250 229;
+  color-scheme: light;
 }
 
-body {
-  @apply bg-slate-100 font-sans text-slate-800 antialiased;
+.dark {
+  --canvas: 11 18 32;
+  --surface: 17 24 39;
+  --surface-raised: 30 41 59;
+  --ink: 241 245 249;
+  --ink-soft: 148 163 184;
+  --ink-mute: 100 116 139;
+  --line: 51 65 85;
+  --accent: 20 184 166;
+  --accent-hover: 45 212 191;
+  --accent-soft: 19 78 74;
+  --danger: 248 113 113;
+  --danger-soft: 60 20 20;
+  --warning: 251 191 36;
+  --warning-soft: 60 40 10;
+  --success: 52 211 153;
+  --success-soft: 10 50 30;
+  color-scheme: dark;
 }
 
-/* Tiptap editor surface */
-.ProseMirror {
-  @apply min-h-[12rem] w-full flex-1 overflow-y-auto px-4 py-3 text-sm leading-relaxed outline-none;
+html, body, #root { height: 100%; }
+body { background: rgb(var(--canvas)); color: rgb(var(--ink)); -webkit-font-smoothing: antialiased; }
+
+*:focus-visible { outline: 2px solid rgb(var(--accent)); outline-offset: 2px; border-radius: 4px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
-.ProseMirror p {
-  @apply my-1.5;
-}
-.ProseMirror blockquote {
-  @apply my-2 border-l-2 border-slate-300 pl-3 text-slate-600;
-}
-.ProseMirror a {
-  @apply text-brand-600 underline;
-}
-.ProseMirror:focus {
-  @apply outline-none;
+
+::selection { background: rgb(var(--accent) / 0.25); }
+
+.scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll-thin::-webkit-scrollbar-track { background: transparent; }
+.scroll-thin::-webkit-scrollbar-thumb { background: rgb(var(--ink-mute) / 0.4); border-radius: 4px; }
+.scroll-thin::-webkit-scrollbar-thumb:hover { background: rgb(var(--ink-mute) / 0.6); }
+
+.sr-only-focusable:not(:focus):not(:focus-within) {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

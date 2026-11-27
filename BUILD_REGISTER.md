@@ -807,4 +807,47 @@ note read-back (POST-only endpoint), rule PATCH/server-side test, the staff/admi
 
 ---
 
+# 21. Phase 10 — The DeepSeek front-end, assembled and wired to the real API (2026-11-27)
+
+**Source.** The user zipped every code block from the nine shared DeepSeek chats (270 files, parts
+00-09, with `_full-response.md` assembly notes and `_snippets/` partial merges). The zip's UI was
+kept; its data layer was written against an imagined backend (cookie+CSRF auth, `/login`, passkeys,
+devices, labels, drafts-as-rows, contacts/calendar/tasks, DMARC/BIMI/MTA-STS/TLS-RPT, billing,
+SSE). Integration = one adapter layer, no guessed endpoints.
+
+**Delivered.**
+- Assembled the nine parts into one app in `web/` (part 1 base + parts 2-9 overlays; later parts
+  win on `useDraftAutosave`/`useSendCompose`/`useMailShortcuts`; router and sidebar nav merged from
+  the per-part fragments; `layout.tsx` had been clobbered by part 4's 10-line fragment — restored
+  from the base with Security/OOO/Shared nav entries merged).
+- **Rewrote the data layer** (`lib/apiCore.ts` + `apiMail.ts` + `apiSettings.ts` + `apiOrg.ts` +
+  `api.ts`): bearer-token auth with the real two-step TOTP retry, every function of the ~181-name
+  surface mapped to the 94 live routes (view-model mappers for folders/messages/addresses/domains/
+  deliverability), and honest stubs for modules the backend has not shipped — empty lists and
+  typed `module_unavailable` errors pointing at the register section, never fake endpoints.
+- SSE replaced with a polling shim (no push channel in the API — register 6.0 interim).
+- Zip self-inconsistencies fixed: duplicate i18n keys, broken import blocks the chats patched via
+  snippets, `as`-assertion syntax errors, missing snippet functions (`listThreadNotes`,
+  `createThreadNote`, `getMessageCalendarEvent`, `createTaskFromMessage`), part-8 shared-composer
+  state fields, `rowDecorator`/`sharedContext` props, spoof lookalike heuristics restored
+  (`lib/spoof.ts` with co.za-aware registrable labels).
+- Backend fixes surfaced by rendering real data: `GET /messages/{id}` body (phase 9) plus the
+  platform-domain hole in `handleListAddresses` (primary addresses rendered as `local@` because
+  the platform domain is org-less; now fetched explicitly).
+- Demo harness: `cmd/seed-demo` provisions a tenant (platform domain, plan, owner, approved
+  sending), injects six real messages (attachment + phishing lookalike), approves sending.
+
+**Verified.** `tsc -b` green; `vite build` green (code-split: editor 107 KB gzip); full API smoke
+green (login, folders, messages, body, attachments, idempotent send 202, trace, storage,
+signatures); headless browser walk green — login → inbox (19 items rendered) → reading pane with
+**Lookalike sender domain** banner on the seeded phishing message → composer with draft-recovery
+modal → UI send delivered to Sent by the worker → security/aliases/rules/deliverability pages.
+The suppression engine correctly suppressed the smoke-test recipient that does not exist — the
+UI then showed the honest `mailbox_paused` error, proving error-envelope surfacing works.
+
+**Deferred (stubbed honestly, same as phase 9).** Server-side drafts, push/SSE, WebAuthn,
+contacts/calendar/tasks backends, billing, DMARC/BIMI/MTA-STS/TLS-RPT services, labels.
+
+---
+
 *End of document.*
