@@ -773,4 +773,38 @@ Everything else sequences behind those.
 
 ---
 
+# 20. Phase 9 — Webmail & org console front-end (`web/`, 2026-11-27)
+
+**Delivered.** The complete browser surface as a monorepo package (`web/`): React 18 + TypeScript
+strict + Vite + Tailwind + Zustand + TipTap + DOMPurify. `make check` green (including e2e against
+the modified message-read path) and `tsc -b && vite build` green; both routes of the built app
+render-verified headlessly.
+
+| Part | Delivered |
+|---|---|
+| Foundation (catalog 1) | Typed API client (bearer on every route, `{error:{code,message,request_id,hint}}` unwrapped into `ApiError`, Idempotency-Key support), the full backend contract typed once in `src/types/api.ts`, auth store handling `mfa_required` / `account_locked` / suspended-org, design primitives, app shell (folder sidebar with unread counts, storage widget, status banners), PWA manifest + shell-only service worker, offline outbox that flushes with each send's original Idempotency-Key |
+| Mail core (catalog 2) | `/mail/:folderId/:messageId` routing, cursor pagination (`before_uid`), reading pane rendering body HTML inside a `sandbox=""` iframe after DOMPurify, SPF/DKIM/DMARC badges + spoof/lookalike/spam-score alerts, authenticated attachment downloads, Mail Trace timeline, tracking honesty-model panel (pixels/opens/links/clicks), thread notes, 30 s/25 s polling (no push channel in the API) |
+| Composer (catalog 3) | TipTap rich text, recipient chips with validation, reply quoting, base64 attachments with executable-file and "mentioned but not attached" warnings, 5 s autosave to local storage, network-failure queueing into the outbox |
+| Part 4 | Aliases/forwards CRUD (idempotent create), signatures with a live HTML linter (scripts, hotlinked images, size, nested tables, alt text), TOTP enrol → activate → disable, session list + revoke, app passwords (secret shown once) |
+| Parts 5 & 6 | Rules builder + client-side test runner (the API has no dry-run endpoint — the preview evaluates the newest loaded inbox page and says so), multi-window autoresponder (`starts_at`/`ends_at`), org tracking toggle, suppression register (POPIA opt-outs) |
+| Org console | Domains (register/verify/DNS records/staged DKIM rotation), users (invite/suspend/resume/kill sessions), quarantine review + release, webhooks (events picker, test fire, secret shown once), API keys (secret shown once), insights (deliverability funnel, health-score ring, 14-day reliability) |
+
+**Backend prerequisite closed (§6.0):** `GET /api/v1/messages/{id}` returned metadata only — the
+reading pane had no body to render. It now parses the content-addressed blob on demand and returns
+`body_text` / `body_html`; a parse failure degrades to empty strings, and the raw route stays the
+byte-exact path.
+
+**Source honesty:** all six DeepSeek share links are unreachable from this sandbox (CloudFront
+geo-block: WebFetch 403, curl 202 challenge shell, headless browser blocked). The build follows the
+user's catalog — parts, feature lists, stack — and the backend contract extracted from
+`internal/api/`, not the link code. If the link contents are pasted later, diff them against
+`web/README.md` and fold in whatever is better.
+
+**Deliberately absent (no fake endpoints):** server-side drafts (no API), WebSocket/SSE push
+(polling until the API grows a browser channel), WebAuthn passkeys (backend enrols TOTP only),
+note read-back (POST-only endpoint), rule PATCH/server-side test, the staff/admin portal
+(Section 11 — separate later surface, same stack).
+
+---
+
 *End of document.*

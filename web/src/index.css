@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-slate-100 font-sans text-slate-800 antialiased;
+}
+
+/* Tiptap editor surface */
+.ProseMirror {
+  @apply min-h-[12rem] w-full flex-1 overflow-y-auto px-4 py-3 text-sm leading-relaxed outline-none;
+}
+.ProseMirror p {
+  @apply my-1.5;
+}
+.ProseMirror blockquote {
+  @apply my-2 border-l-2 border-slate-300 pl-3 text-slate-600;
+}
+.ProseMirror a {
+  @apply text-brand-600 underline;
+}
+.ProseMirror:focus {
+  @apply outline-none;
+}

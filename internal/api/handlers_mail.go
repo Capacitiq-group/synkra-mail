@@ -331,10 +331,24 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		mapError(w, aerr)
 		return
 	}
+	// Webmail prerequisite (§2): the reading pane needs the decoded body.
+	// Parse the content-addressed blob on demand; a parse failure degrades
+	// to empty strings instead of a 5xx — the metadata view above still
+	// renders, and the raw route stays the byte-exact path.
+	var bodyText, bodyHTML string
+	if rc, berr := s.Pipeline.Blobs.Open(r.Context(), full.Message.BlobSHA256); berr == nil {
+		raw := readAllB(rc)
+		_ = rc.Close()
+		if p, perr := mimeutil.Parse(raw); perr == nil {
+			bodyText, bodyHTML = p.Text, p.HTML
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"message": messageView(&full.Message),
-		"item":    itemView(&full.Item),
-		"folder":  folderViews([]model.Folder{full.Folder})[0],
+		"message":   messageView(&full.Message),
+		"item":      itemView(&full.Item),
+		"folder":    folderViews([]model.Folder{full.Folder})[0],
+		"body_text": bodyText,
+		"body_html": bodyHTML,
 	})
 }
 
