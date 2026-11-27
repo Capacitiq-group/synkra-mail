@@ -28,9 +28,19 @@ type Store interface {
 }
 
 // Layout: blobs/{aa}/{sha256} — flat sharding is enough at Stage-A scale.
+// The sha argument is validated as 64 lowercase hex characters: Open/Stat/
+// Delete accept caller-supplied keys (today always DB-stored computed shas,
+// but the interface is public), and a key like "../.." must never reach a
+// filesystem or object key. Returns "" for invalid input; implementations
+// must treat "" as ErrNotFound.
 func PathFor(sha string) string {
-	if len(sha) < 2 {
+	if len(sha) != 64 {
 		return ""
+	}
+	for _, c := range sha {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return ""
+		}
 	}
 	return fmt.Sprintf("%s/%s", sha[:2], sha)
 }

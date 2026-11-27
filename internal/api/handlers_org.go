@@ -406,7 +406,15 @@ func (s *Server) handleGetAttachment(w http.ResponseWriter, r *http.Request) {
 	defer rc.Close()
 	w.Header().Set("Content-Type", att.ContentType)
 	if att.Filename != "" {
-		w.Header().Set("Content-Disposition", "attachment; filename=\""+strings.ReplaceAll(att.Filename, "\"", "")+"\"")
+		// Strip quotes AND line breaks: a crafted stored filename must never
+		// inject headers (audit sweep).
+		safe := strings.Map(func(r rune) rune {
+			if r == '"' || r == '\r' || r == '\n' {
+				return -1
+			}
+			return r
+		}, att.Filename)
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+safe+"\"")
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(readAllB(rc))

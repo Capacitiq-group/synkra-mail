@@ -198,6 +198,31 @@ func SetDomainStatus(ctx context.Context, tx pgx.Tx, domainID uuid.UUID, status 
 	return err
 }
 
+// DeleteDomain removes a domain the org no longer hosts. Refuses when
+// addresses still route through it (decommission those first) — the delete
+// endpoint was missing entirely (audit-sweep finding: domains could be
+// registered but never decommissioned).
+func DeleteDomain(ctx context.Context, tx pgx.Tx, domainID uuid.UUID) error {
+	var n int
+	if err := tx.QueryRow(ctx, `select count(*) from mail.address where domain_id=$1`, domainID).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return ErrDomainInUse
+	}
+	ct, err := tx.Exec(ctx, `delete from mail.domain where id=$1 and is_platform=false`, domainID)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ErrDomainInUse: addresses still route through the domain.
+var ErrDomainInUse = errors.New("domain still has addresses routed through it")
+
 // CountDomainsByOrg: the per-org registration cap (audit item 11: an unlimited
 // loop of RSA key generation inside requests is a CPU/pool DoS).
 func CountDomainsByOrg(ctx context.Context, q Querier, orgID uuid.UUID) (int, error) {

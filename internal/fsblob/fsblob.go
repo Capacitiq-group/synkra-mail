@@ -23,8 +23,12 @@ func New(root string) (*Store, error) {
 	return &Store{root: root}, nil
 }
 
-func (s *Store) path(sha string) string {
-	return filepath.Join(s.root, blob.PathFor(sha))
+func (s *Store) path(sha string) (string, error) {
+	p := blob.PathFor(sha)
+	if p == "" {
+		return "", blob.ErrNotFound // invalid key, never a path
+	}
+	return filepath.Join(s.root, p), nil
 }
 
 func (s *Store) Put(ctx context.Context, r io.Reader) (string, int64, error) {
@@ -44,7 +48,10 @@ func (s *Store) Put(ctx context.Context, r io.Reader) (string, int64, error) {
 		return "", 0, err
 	}
 	sha := hr.Sum()
-	dst := s.path(sha)
+	dst, err := s.path(sha)
+	if err != nil {
+		return "", 0, err
+	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", 0, err
 	}
@@ -56,7 +63,11 @@ func (s *Store) Put(ctx context.Context, r io.Reader) (string, int64, error) {
 }
 
 func (s *Store) Open(ctx context.Context, sha string) (io.ReadCloser, error) {
-	f, err := os.Open(s.path(sha))
+	p, err := s.path(sha)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, blob.ErrNotFound
 	}
@@ -64,7 +75,11 @@ func (s *Store) Open(ctx context.Context, sha string) (io.ReadCloser, error) {
 }
 
 func (s *Store) Stat(ctx context.Context, sha string) (int64, error) {
-	fi, err := os.Stat(s.path(sha))
+	p, err := s.path(sha)
+	if err != nil {
+		return 0, err
+	}
+	fi, err := os.Stat(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, blob.ErrNotFound
 	}
@@ -72,7 +87,11 @@ func (s *Store) Stat(ctx context.Context, sha string) (int64, error) {
 }
 
 func (s *Store) Delete(ctx context.Context, sha string) error {
-	err := os.Remove(s.path(sha))
+	p, err := s.path(sha)
+	if err != nil {
+		return err
+	}
+	err = os.Remove(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}

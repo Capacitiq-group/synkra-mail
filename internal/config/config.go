@@ -82,6 +82,14 @@ type Config struct {
 	// Inbound protection (audit item 5 / 29).
 	MaxInboundConns int // concurrent inbound SMTP connections (0 = 256 default)
 
+	// Authoritative DNS edge (§4b — the dnsd process).
+	DNSUDPAddr     string        // UDP listener (port 53 prod)
+	DNSTCPAddr     string        // TCP listener (port 53 prod)
+	DNSHealthAddr  string        // dnsd health endpoint (empty = none)
+	DNSSecondaries []string      // CIDRs allowed to AXFR; EMPTY = deny all (4b.7)
+	DNSNSHosts     []string      // authoritative NS hostnames (4b.2)
+	DNSZoneRefresh time.Duration // zone re-read cadence
+
 	// Limits (owner policy, Section 7.3).
 	Limits Limits
 
@@ -216,6 +224,13 @@ func Load() (*Config, error) {
 		ReverifyIntervalDays:   envInt("SYNKRA_MAIL_REVERIFY_DAYS", 365),
 
 		MaxInboundConns: envInt("SYNKRA_MAIL_MAX_INBOUND_CONNS", 256),
+
+		DNSUDPAddr:     envStr("SYNKRA_MAIL_DNS_UDP_ADDR", "127.0.0.1:5353"),
+		DNSTCPAddr:     envStr("SYNKRA_MAIL_DNS_TCP_ADDR", "127.0.0.1:5353"),
+		DNSHealthAddr:  envStr("SYNKRA_MAIL_DNS_HEALTH_ADDR", ""),
+		DNSSecondaries: envList("SYNKRA_MAIL_DNS_SECONDARIES"), // empty = AXFR denied (4b.7)
+		DNSNSHosts:     envListDefault("SYNKRA_MAIL_DNS_NS_HOSTS", "ns1.synkra.email,ns2.synkra.email"),
+		DNSZoneRefresh: envDur("SYNKRA_MAIL_DNS_ZONE_REFRESH", 15*time.Second),
 
 		Limits: Limits{
 			NewOrgDaily:          envInt("SYNKRA_MAIL_NEW_ORG_DAILY", 100),
@@ -457,4 +472,27 @@ func envDur(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// envList parses a comma-separated env value into a list ("" → nil).
+func envList(key string) []string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// envListDefault parses a comma-separated env value with a default list.
+func envListDefault(key, def string) []string {
+	if os.Getenv(key) == "" {
+		return envList(def)
+	}
+	return envList(os.Getenv(key))
 }

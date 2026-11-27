@@ -106,9 +106,22 @@ func (c *Client) Put(ctx context.Context, r io.Reader) (string, int64, error) {
 	return sha, hr.Size(), nil
 }
 
+// keyFor validates the sha and returns the object key ("" keys never reach
+// the object store — blob.PathFor refuses non-hex input).
+func keyFor(sha string) (string, error) {
+	key := blob.PathFor(sha)
+	if key == "" {
+		return "", blob.ErrNotFound
+	}
+	return key, nil
+}
+
 // Open returns a reader over the object body; the caller must close it.
 func (c *Client) Open(ctx context.Context, sha string) (io.ReadCloser, error) {
-	key := blob.PathFor(sha)
+	key, err := keyFor(sha)
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(key).String(), nil)
 	if err != nil {
 		return nil, err
@@ -132,7 +145,10 @@ func (c *Client) Open(ctx context.Context, sha string) (io.ReadCloser, error) {
 
 // Stat reports the object size via HEAD.
 func (c *Client) Stat(ctx context.Context, sha string) (int64, error) {
-	key := blob.PathFor(sha)
+	key, err := keyFor(sha)
+	if err != nil {
+		return 0, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(key).String(), nil)
 	if err != nil {
 		return 0, err
@@ -156,7 +172,10 @@ func (c *Client) Stat(ctx context.Context, sha string) (int64, error) {
 // Delete removes the object. Missing objects are a no-op, matching fsblob
 // semantics (GC only; customer mail is never auto-deleted).
 func (c *Client) Delete(ctx context.Context, sha string) error {
-	key := blob.PathFor(sha)
+	key, err := keyFor(sha)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.objectURL(key).String(), nil)
 	if err != nil {
 		return err

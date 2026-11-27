@@ -48,7 +48,6 @@ func (s *Server) Routes() http.Handler {
 			r.Use(s.limitBody(1 << 20)) // 1 MiB default JSON envelope
 			r.Get("/me", s.handleMe)
 			r.Post("/auth/logout", s.handleLogout)
-			r.Post("/me/password", s.handleChangeOwnPassword)
 
 			// MFA (audit item 3), sessions, verification.
 			r.Post("/me/mfa/enrol", s.handleMFAEnrol)
@@ -69,8 +68,6 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/org/users/{id}/resume", s.handleResumeOrgUser)
 			r.Post("/org/users/{id}/revoke-sessions", s.handleRevokeUserSessions)
 			r.Get("/org/shared-mailboxes/{id}/members", s.handleListSharedMailboxMembers)
-			r.Post("/org/shared-mailboxes/{id}/members", s.handleAddSharedMailboxMember)
-			r.Delete("/org/shared-mailboxes/{id}/members", s.handleRemoveSharedMailboxMember)
 
 			// Quarantine (register §2.11): the spam verdict engines are hook
 			// points only for now; the console surface ships with them.
@@ -96,19 +93,17 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/org/deliverability", s.handleOrgDeliverability)
 
 			// Differentiators §13: health score, reliability monitor, webhooks,
-			// API keys (the API is the product).
+			// API keys (the API is the product). Mutating routes live in the
+			// backdoor-guard group below — single registration each.
 			r.Get("/org/health", s.handleOrgHealth)
 			r.Get("/org/reliability", s.handleOrgReliability)
 			r.Get("/org/webhooks", s.handleListWebhooks)
-			r.Post("/org/webhooks", s.handleCreateWebhook)
 			r.Delete("/org/webhooks/{id}", s.handleDeleteWebhook)
 			r.Post("/org/webhooks/{id}/test", s.handleTestWebhook)
 			r.Get("/org/api-keys", s.handleListAPIKeys)
-			r.Post("/org/api-keys", s.handleCreateAPIKey)
 			r.Delete("/org/api-keys/{id}", s.handleRevokeAPIKey)
 
 			r.Get("/app-passwords", s.handleListAppPasswords)
-			r.Post("/app-passwords", s.handleCreateAppPassword)
 			r.Delete("/app-passwords/{id}", s.handleRevokeAppPassword)
 
 			r.Get("/mailboxes", s.handleListMailboxes)
@@ -129,35 +124,34 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/storage", s.handleStorage)
 
 			r.Get("/addresses", s.handleListAddresses)
-			r.Post("/addresses", s.handleCreateAddress)
 			r.Delete("/addresses/{id}", s.handleDeleteAddress)
 			r.Get("/domains", s.handleListDomains)
-			r.Post("/domains", s.handleCreateDomain)
 			r.Post("/domains/{id}/verify", s.handleVerifyDomain)
 			r.Get("/domains/{id}/dns", s.handleDomainDNS)
 			r.Post("/domains/{id}/rotate-dkim", s.handleStageDKIMRotation)
 			r.Post("/domains/{id}/activate-dkim", s.handleActivateDKIMRotation)
 
 			r.Get("/org", s.handleGetOrg)
-			r.Put("/org/tracking", s.handleSetTracking)
 			r.Post("/threads/{id}/note", s.handleThreadNote)
 			r.Post("/threads/{id}/assign", s.handleThreadAssign)
 
-			// Backdoor paths: impersonated sessions must never reach these —
-			// a chosen password, a silent forward, a registered domain or an
-			// exfil webhook outlives the session (audit item 3).
+			// Backdoor closures (audit item 3): impersonated sessions never
+			// mint credentials, forward mail, register or delete domains,
+			// grant mailbox access, wire exfil webhooks or flip tracking.
+			// Each route is registered exactly once, behind the guard.
 			r.Group(func(r chi.Router) {
 				r.Use(s.requireNotImpersonating)
 				r.Post("/users/invite", s.handleCreateUser)
 				r.Post("/org/webhooks", s.handleCreateWebhook)
 				r.Put("/org/tracking", s.handleSetTracking)
-				r.Post("/org/shared-mailboxes/{id}/members", s.handleAddSharedMailboxMember)
-				r.Delete("/org/shared-mailboxes/{id}/members", s.handleRemoveSharedMailboxMember)
 				r.Post("/addresses", s.handleCreateAddress)
 				r.Post("/domains", s.handleCreateDomain)
+				r.Delete("/domains/{id}", s.handleDeleteDomain)
 				r.Post("/org/api-keys", s.handleCreateAPIKey)
 				r.Post("/app-passwords", s.handleCreateAppPassword)
 				r.Post("/me/password", s.handleChangeOwnPassword)
+				r.Post("/org/shared-mailboxes/{id}/members", s.handleAddSharedMailboxMember)
+				r.Delete("/org/shared-mailboxes/{id}/members", s.handleRemoveSharedMailboxMember)
 			})
 		})
 
@@ -387,6 +381,9 @@ func mapError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrInvalidDomain):
 		writeErrorHint(w, http.StatusBadRequest, "invalid_domain", err.Error(),
 			"use a registrable FQDN: lowercase labels, hyphens not leading/trailing, a lettered TLD")
+	case errors.Is(err, store.ErrDomainInUse):
+		writeErrorHint(w, http.StatusConflict, "domain_in_use", err.Error(),
+			"delete the aliases and forwarding addresses on this domain first")
 	case errors.Is(err, errKeyReuse):
 		writeErrorHint(w, http.StatusUnprocessableEntity, "idempotency_key_reuse", err.Error(),
 			"repeat the exact same request body with this key, or send a fresh key")

@@ -128,15 +128,22 @@ func (s *Service) postUnsubscribe(orgID, mailboxID uuid.UUID, rcpt string) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.CoreInternalURL, bytes.NewReader(body))
 	if err != nil {
+		log.Printf("[tracker] unsubscribe request build: %v", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Synkra-Tracker-Signature", krypto.HMACSign([]byte(s.Secret), string(body)))
 	resp, err := s.HTTP.Do(req)
 	if err != nil {
+		// A swallowed error here means the user believes they unsubscribed
+		// but the suppression was never written (audit sweep: silent failures).
+		log.Printf("[tracker] unsubscribe post: %v", err)
 		return
 	}
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		log.Printf("[tracker] unsubscribe post rejected: status=%d", resp.StatusCode)
+	}
 }
 
 // postEvent signs and posts the event to the core internal endpoint.

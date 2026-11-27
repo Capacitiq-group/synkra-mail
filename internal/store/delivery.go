@@ -275,13 +275,13 @@ func ListSuppressionAll(ctx context.Context, q Querier, limit int) ([]model.Supp
 // ReserveSend atomically reserves n sends against a counter key
 // ("org:<uuid>:<yyyymmdd>" or "mb:<uuid>:<yyyymmddhh>") and returns false when
 // the cap is already exhausted. One statement — no read-modify-write race.
-func ReserveSend(ctx context.Context, q Querier, counterKey string, n, cap int) (bool, error) {
+func ReserveSend(ctx context.Context, q Querier, counterKey string, n, limit int) (bool, error) {
 	var used int
 	err := q.QueryRow(ctx, `
 		insert into mail.send_counter (counter_key, used) values ($1, $2)
 		on conflict (counter_key) do update set used = send_counter.used + $2, updated_at = now()
 		where send_counter.used + $2 <= $3
-		returning used`, counterKey, n, cap).Scan(&used)
+		returning used`, counterKey, n, limit).Scan(&used)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}

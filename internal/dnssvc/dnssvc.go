@@ -169,6 +169,55 @@ func bumpSerial(ctx context.Context, tx store.Tx, zoneID uuid.UUID) {
 	_, _ = tx.Exec(ctx, `update mail.dns_zone set serial = serial + 1, updated_at=now() where id=$1`, zoneID)
 }
 
+// ---- tenancy guards (audit sweep): the API wiring MUST use the *ForOrg
+// variants so a customer can only touch zones they own ----
+
+// ErrZoneNotOwned: the zone exists but belongs to another org (or none).
+var ErrZoneNotOwned = fmt.Errorf("zone not owned by this organisation")
+
+func (d *PGDnsService) assertZoneOwner(ctx context.Context, q store.Querier, zone string, orgID uuid.UUID) error {
+	var owner *uuid.UUID
+	err := q.QueryRow(ctx, `select owner_org_id from mail.dns_zone where zone=$1`,
+		strings.ToLower(strings.TrimSuffix(zone, "."))).Scan(&owner)
+	if err != nil {
+		return err
+	}
+	if owner == nil || *owner != orgID {
+		return ErrZoneNotOwned
+	}
+	return nil
+}
+
+// PutRecordForOrg mutates a record only when the zone belongs to orgID.
+func (d *PGDnsService) PutRecordForOrg(ctx context.Context, orgID uuid.UUID, zone string, rec Record) (uuid.UUID, error) {
+	if err := d.assertZoneOwner(ctx, d.Store.Pool, zone, orgID); err != nil {
+		return uuid.Nil, err
+	}
+	return d.PutRecord(ctx, zone, rec)
+}
+
+// DeleteRecordForOrg deletes a record only when its zone belongs to orgID.
+func (d *PGDnsService) DeleteRecordForOrg(ctx context.Context, orgID uuid.UUID, recordID uuid.UUID) error {
+	var owner *uuid.UUID
+	err := d.Store.Pool.QueryRow(ctx, `select z.owner_org_id from mail.dns_record r
+		join mail.dns_zone z on z.id = r.zone_id where r.id=$1`, recordID).Scan(&owner)
+	if err != nil {
+		return err
+	}
+	if owner == nil || *owner != orgID {
+		return ErrZoneNotOwned
+	}
+	return d.DeleteRecord(ctx, recordID)
+}
+
+// BatchApplyForOrg writes a record set only when the zone belongs to orgID.
+func (d *PGDnsService) BatchApplyForOrg(ctx context.Context, orgID uuid.UUID, zone string, records []Record) error {
+	if err := d.assertZoneOwner(ctx, d.Store.Pool, zone, orgID); err != nil {
+		return err
+	}
+	return d.BatchApply(ctx, zone, records)
+}
+
 func (d *PGDnsService) audit(ctx context.Context, tx store.Tx, zoneID uuid.UUID, action string, detail map[string]any) error {
 	raw, err := json.Marshal(detail)
 	if err != nil {
