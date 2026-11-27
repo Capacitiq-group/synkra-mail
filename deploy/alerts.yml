@@ -1,0 +1,57 @@
+# Prometheus alert rules for Synkra Mail (docs/ALERTING.md, register 3.6 + 2.12).
+# Wire into the scrape config when monitoring lands; `page` = notify on-call.
+groups:
+  - name: synkra-mail-probes
+    rules:
+      - alert: MailAPIHealthzDown
+        expr: up{job="synkra-mail-api"} == 0 or probe_success{probe="healthz"} == 0
+        for: 30s
+        labels: {severity: page}
+        annotations:
+          summary: "Synkra Mail API liveness failing"
+      - alert: MailReadyzDown
+        expr: probe_success{probe="readyz"} == 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Synkra Mail dependencies failing (DB/blob)"
+
+  - name: synkra-mail-delivery
+    rules:
+      - alert: OutboundQueueDepth
+        expr: synkra_delivery_queue_depth > 500
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: "outbound queue not draining ({{ $value }} jobs)"
+      - alert: DeliveryFailureRate
+        expr: sum(rate(synkra_delivery_attempts_total{outcome!="delivered"}[30m]))
+              / clamp_min(sum(rate(synkra_delivery_attempts_total[30m])), 1) > 0.05
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "delivery failure rate above 5% over 30 minutes"
+      - alert: BounceBreakerTripped
+        expr: increase(synkra_breaker_trips_total[10m]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "bounce breaker paused a mailbox — admin review needed"
+      - alert: BlobGCLag
+        expr: synkra_purgeable_blobs > 1000
+        for: 30m
+        labels: {severity: ticket}
+        annotations:
+          summary: "janitor blob GC is falling behind"
+
+  - name: synkra-mail-backup
+    rules:
+      - alert: BackupStale
+        expr: time() - synkra_last_backup_timestamp > 93600  # 26h
+        labels: {severity: page}
+        annotations:
+          summary: "no successful backup in 26 hours"
+      - alert: RestoreDrillFailed
+        expr: synkra_restorecheck_success == 0
+        labels: {severity: page}
+        annotations:
+          summary: "restore verification failed — the backup is not proven restorable"

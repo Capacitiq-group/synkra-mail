@@ -1,0 +1,9 @@
+.git
+.github
+.env
+devdata
+data
+*.log
+BUILD_REGISTER.md
+docs
+scripts

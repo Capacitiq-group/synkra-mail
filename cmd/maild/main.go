@@ -31,6 +31,7 @@ import (
 	"synkra.email/mail/internal/fsblob"
 	"synkra.email/mail/internal/imapd"
 	"synkra.email/mail/internal/ingest"
+	"synkra.email/mail/internal/janitor"
 	"synkra.email/mail/internal/krypto"
 	"synkra.email/mail/internal/model"
 	"synkra.email/mail/internal/outbound"
@@ -121,7 +122,7 @@ func main() {
 			roles[strings.TrimSpace(r)] = true
 		}
 	} else {
-		for _, r := range []string{"api", "smtp", "submission", "imap", "worker", "tracker"} {
+		for _, r := range []string{"api", "smtp", "submission", "imap", "worker", "tracker", "janitor"} {
 			roles[r] = true
 		}
 	}
@@ -199,6 +200,22 @@ func main() {
 		defer gracefulQueueDrain(workerWG)
 		log.Printf("[worker] %d outbound workers started (transport=%s)", workers,
 			map[bool]string{true: "smtp", false: "loopback"}[cfg.Env == "prod"])
+	}
+
+	if roles["janitor"] {
+		jan := &janitor.Janitor{
+			Store: st,
+			Blobs: blobStore,
+			Cfg: janitor.Config{
+				Interval:                  cfg.JanitorInterval,
+				LoginAttemptRetentionDays: cfg.LoginAttemptRetentionDays,
+				RateEventRetentionDays:    cfg.RateEventRetentionDays,
+				IdempotencyRetentionDays:  cfg.IdempotencyRetentionDays,
+				BlobBatch:                 cfg.BlobGCBatch,
+			},
+		}
+		go jan.Run(ctx)
+		log.Printf("[janitor] cleanup loop started (interval %s)", cfg.JanitorInterval)
 	}
 
 	if roles["tracker"] {

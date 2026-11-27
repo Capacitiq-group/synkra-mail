@@ -127,6 +127,18 @@ func parseReferences(v string) []string {
 // NormalizeSubject strips Re:/Fwd: prefixes for threading (Section 4.2).
 var subjPrefix = regexp.MustCompile(`(?i)^\s*((re|fwd?|aw|sv)(\[\d+\])?\s*:\s*)+`)
 
+// NormalizeWire rewrites bare LF line endings to CRLF (RFC 5321 2.3.8: mail
+// data is SMTP-normalised before storage or relay). go-smtp passes DATA bytes
+// through unmodified, so a client sending bare LF would otherwise store and
+// relay it verbatim (build register 3.7). Bare CR bytes are left untouched.
+func NormalizeWire(raw []byte) []byte {
+	if bytes.IndexByte(raw, '\n') < 0 {
+		return raw
+	}
+	step := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	return bytes.ReplaceAll(step, []byte("\n"), []byte("\r\n"))
+}
+
 func NormalizeSubject(s string) string {
 	s = strings.TrimSpace(s)
 	for subjPrefix.MatchString(s) {

@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -64,6 +65,15 @@ var (
 	sharedErr  error
 )
 
+// adminURLFor derives the maintenance URL (postgres database) from a test URL.
+func adminURLFor(u string) string {
+	m := regexp.MustCompile(`^(postgres(?:\+[^:]+)?://)([^@/]+@)?([^/]+)/.+`)
+	if m.MatchString(u) {
+		return m.ReplaceAllString(u, "${1}${2}${3}/postgres?sslmode=disable")
+	}
+	return "postgres://synkra@127.0.0.1:5433/postgres?sslmode=disable"
+}
+
 func testDBURL() string {
 	if u := getenv("SYNKRA_MAIL_TEST_URL"); u != "" {
 		return u
@@ -88,8 +98,9 @@ func bootStack() (*stack, error) {
 	if err := db.EnsureDatabase(ctx, url); err != nil {
 		return nil, err
 	}
-	// Wipe: fresh database per test run.
-	admin, err := sql.Open("pgx", "postgres://synkra@127.0.0.1:5433/postgres?sslmode=disable")
+	// Wipe: fresh database per test run. The admin URL is derived from the
+	// test URL so CI service containers (different user/port) work unchanged.
+	admin, err := sql.Open("pgx", adminURLFor(url))
 	if err == nil {
 		_, _ = admin.Exec(`select pg_terminate_backend(pid) from pg_stat_activity where datname='synkra_mail_test'`)
 		_, _ = admin.Exec(`drop database if exists synkra_mail_test`)

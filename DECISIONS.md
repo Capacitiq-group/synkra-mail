@@ -49,6 +49,8 @@ manageable first release.
 | N | Org-invite decline (§2.1) | There is no pending user-invite object to decline (invites create users immediately); "decline" maps to the org review application: POST /admin/orgs/{id}/decline plus a review_status filter on the queue. |
 | O | Quarantine release (§2.11) | Release removes the quarantine row and audits it; re-injecting the held message lands with the spam verdict engines (hook points only, disabled by design for the pilot). |
 | P | Attachment API (§2.10) | The list + download routes serve existing attachment blobs; mimeutil.Att gained JSON tags so the send API reads content_type correctly. |
+| Q | Bare-LF wire normalisation (§3.7) | go-smtp passes DATA bytes through unmodified, so bare LF was stored and relayed verbatim; DeliverInbound and submission queueing now normalise to CRLF (RFC 5321), verified by a wire-level test. |
+| R | Restore drill (§3.5) | cmd/restorecheck dumps every mail table, rebuilds the schema from migrations in a scratch DB, restores, verifies counts and a write probe; the sandbox's embedded Postgres has no pg_dump, so the drill is dependency-free Go. Production keeps pg_dump + WAL archiving per the runbook. |
 
 ### Explicitly still pending
 

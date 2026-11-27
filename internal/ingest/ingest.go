@@ -127,6 +127,9 @@ func max64(a, b int64) int64 {
 // DeliverInbound runs the full inbound path for one recipient copy.
 // Errors of type *SMTPError carry the code the MX must return.
 func (d *Deps) DeliverInbound(ctx context.Context, raw []byte, envFrom, rcptTo string, av *AuthVerdicts) (*Result, error) {
+	// Wire normalisation (build register 3.7): bare LF becomes CRLF before
+	// anything is stored or re-queued.
+	raw = mimeutil.NormalizeWire(raw)
 	local, domain, err := splitRcpt(rcptTo)
 	if err != nil {
 		return nil, &SMTPError{Code: 501, Message: "bad recipient address"}

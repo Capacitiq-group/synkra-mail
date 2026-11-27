@@ -21,6 +21,7 @@ import (
 	"synkra.email/mail/internal/authn"
 	"synkra.email/mail/internal/config"
 	"synkra.email/mail/internal/ingest"
+	"synkra.email/mail/internal/mimeutil"
 	"synkra.email/mail/internal/store"
 )
 
@@ -401,5 +402,8 @@ func (s *subSession) Data(r io.Reader) error {
 	if s.srv.QueueSubmission == nil {
 		return &gosmtp.SMTPError{Code: 451, Message: "4.3.0 submission not wired"}
 	}
+	// Wire normalisation (build register 3.7): the queued message is stored and
+	// relayed verbatim, so bare LF must become CRLF here.
+	raw = mimeutil.NormalizeWire(raw)
 	return s.srv.QueueSubmission(context.Background(), s.userID, s.orgID, raw, s.from, s.rcpts)
 }

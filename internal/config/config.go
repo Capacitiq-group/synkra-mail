@@ -74,6 +74,11 @@ type Config struct {
 	// Outbound worker tuning.
 	WorkerCount          int
 	WorkerPollInterval   time.Duration
+	JanitorInterval      time.Duration
+	LoginAttemptRetentionDays int
+	RateEventRetentionDays    int
+	IdempotencyRetentionDays  int
+	BlobGCBatch          int
 	QueueEscapeHatchJobs int // Section 5.3: documented, not acted on at this scale
 }
 
@@ -196,6 +201,11 @@ func Load() (*Config, error) {
 
 		WorkerCount:          envInt("SYNKRA_MAIL_WORKERS", 4),
 		WorkerPollInterval:   envDur("SYNKRA_MAIL_WORKER_POLL", 2*time.Second),
+		JanitorInterval:           envDur("SYNKRA_MAIL_JANITOR_INTERVAL", time.Hour),
+		LoginAttemptRetentionDays: envInt("SYNKRA_MAIL_LOG_RETENTION_DAYS", 30),
+		RateEventRetentionDays:    envInt("SYNKRA_MAIL_RATE_RETENTION_DAYS", 90),
+		IdempotencyRetentionDays:  envInt("SYNKRA_MAIL_IDEMPOTENCY_RETENTION_DAYS", 7),
+		BlobGCBatch:               envInt("SYNKRA_MAIL_BLOB_GC_BATCH", 500),
 		QueueEscapeHatchJobs: 5000,
 	}
 
