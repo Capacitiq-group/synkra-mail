@@ -82,3 +82,104 @@ before the M1 pilot is operational, not architectural: run the tracker and DNS
 edge as separate services, one real-network send test from the VPS, the owner
 items that were never code (DNS records, IP warm-up, POPIA review), and the
 short open list in §5.
+
+---
+
+# Phase 11 — product surface expansion (28 November 2026, commit 67a1a99+)
+
+Scope: the four commercial modules the register queued behind the audits —
+registrar-managed **Domains & DNS doctor** (Oner/ZARC), the **IMAP migration
+assistant**, **storage usage**, and **billing** (Paystack, ZAR, 15% VAT).
+State per module, verified on this commit:
+
+## Domains & DNS doctor — implemented, registrar wire contract UNVERIFIED
+
+- **Wizard**: availability check → registrant contact → delegation choice →
+  registration through the Oner reseller adapter; the authoritative zone is
+  provisioned (`dnssvc.EnsureMailReadyZone`) **before** delegation so the
+  first lookup after switching nameservers answers (register §4b zero-cache
+  path). ZARC state (`pending_create` → `ok`) surfaces on the dashboard.
+- **Lifecycle**: registry status + add-grace/renew-grace/redemption/
+  pending-delete/expired states derived from expiry (`DeriveLifecycle`,
+  tested); grace-window copy on the dashboard; renew (+1 year) endpoint.
+- **DNS doctor**: `/domains/{id}/doctor` = phase-8 expected records + LIVE
+  verdicts from `dnssvc.Doctor` — pass / fail / **unverifiable** (never
+  pass-by-default when DNS is unreachable). Per-record setup instructions for
+  konsoleH, ClientZone (Afrihost), Domains.co.za, Truehost and Cloudflare
+  (DNS-only warning for mail records), each record value with a copy button.
+- **Nameservers**: switch between our authoritative pair (fully managed) and
+  custom delegation (partially managed — banner + doctor still checks records
+  at the provider). **Transfer lock, WHOIS privacy, auto-renew** toggles call
+  through the registrar and are audited.
+- **EPP/auth-code retrieval is step-up protected**: password re-confirmation
+  against the stored hash, fail-closed, audit-paired (`domain.epp_retrieved`).
+  Transfer-out requires the code. **Registrant contacts** update triggers a
+  registry `pending_update`.
+- **The caveat that matters**: docs.oner.co.za was unreachable from the build
+  sandbox (connection timeout), so the wire paths in `internal/registrar/oner.go`
+  are modelled on the documented operation set and marked `TODO(oner-verify)`.
+  They are the ONLY place to touch once the live docs are reachable; with no
+  `SYNKRA_MAIL_REGISTRAR_API_KEY` the adapter runs dry-run (refused in prod),
+  which is what the tests and demo use.
+
+## IMAP migration assistant — implemented
+
+Source config (host/port/security/username; password **sealed at rest** with
+the platform key, unsealed only inside the worker) → live folder probe with
+message counts and suggested destinations → editable folder mapping → job
+runs through the real ingest pipeline (wire normalisation, spam analysis,
+blob handling) and then moves each item to its mapped folder. Pause/resume/
+cancel take effect **between** items — a message is never half-delivered.
+Per-message failures land on the attention list with attempt counts and
+errors; the job continues. Worker is a 10s poll loop in the `worker` role;
+claimed leases use `FOR UPDATE SKIP LOCKED`.
+
+## Storage usage — implemented
+
+`GET /org/storage/usage`: quota totals (phase-8 engine), per-folder byte
+breakdown, top-10 largest messages, and deterministic cleanup suggestions
+(stale Trash/Spam >30d, large old messages >5 MB/90d, duplicate-size
+clusters). UI: usage bar with grace/over state, folder bars, largest list,
+suggestions. Mail is never auto-deleted (standing owner decision).
+
+## Billing — implemented (charging config-gated)
+
+Invoices with **per-line 15% VAT derived server-side** (rounded to cents,
+totals computed — never trusted from callers), `SM-YYYY-####` numbering,
+7-day terms; **Paystack** initialise (hosted checkout) + verify; verified
+checkouts mark the invoice paid, record payment history and save the card as
+a reusable masked payment method. Billing contact (e-mail/name/VAT number)
+on the org. Without `SYNKRA_MAIL_PAYSTACK_SECRET_KEY` the pay endpoint
+answers 501 `not_configured` honestly and the invoice stays open; dev-only
+manual capture exists for demos and is refused in prod.
+
+## Z1 Storage — config, not code
+
+The S3-compatible blob driver shipped in phase 8 (hand-rolled SigV4 client,
+no SDK, bucket-in-path supported) — Z1 Storage (Johannesburg, S3-compatible,
+R0.30/GB) is a configuration target: `SYNKRA_MAIL_BLOB_MODE=s3` +
+`SYNKRA_MAIL_S3_ENDPOINT/BUCKET/ACCESS_KEY/SECRET_KEY` (endpoint hostname is
+published in their portal, not on the marketing site). Residency sign-off is
+the owner's, per §14.1 of the design doc.
+
+## Verification on this commit
+
+`make check` green (fmt, build, vet, full unit + E2E suite), including new
+tests: VAT line math (15%, rounding), lifecycle derivation + dry-run
+registrator behaviours, and four API-level E2E tests — wizard (check →
+register → ZARC pending → zone provisioned → nameservers→partial → toggles →
+EPP wrong-password refusal / correct-password code), billing preview VAT +
+invoice + payment history, storage usage shape, migration job lifecycle
+(probe 502 on unreachable source, transitions, delete). Webmail `tsc`/`vite`
+green; every new page walked in a live browser against the seeded stack.
+
+## Updated open list (new items from phase 11)
+
+- `TODO(oner-verify)`: confirm the Oner wire contract against live docs
+  before enabling a real reseller key; webhook for ZARC status changes
+  (today: dashboard "Refresh from registrar").
+- Paystack webhook handler for out-of-band captures (today: verify-on-poll).
+- Migration worker: batch sizes/parallelism tuning; IMAP IDLE for live
+  progress; migration of message flags is pending (read/star state).
+- Domain renewal invoices are generated on demand; auto-renew charging on
+  expiry-30d lands with the billing scheduler.
