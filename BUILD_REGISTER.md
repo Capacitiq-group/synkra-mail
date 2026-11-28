@@ -849,5 +849,31 @@ UI then showed the honest `mailbox_paused` error, proving error-envelope surfaci
 contacts/calendar/tasks backends, billing, DMARC/BIMI/MTA-STS/TLS-RPT services, labels.
 
 ---
+---
+
+# 22. Phase 11 — Domains & DNS doctor, migration, storage, billing (2026-11-28)
+
+**Delivered** (commit 67a1a99):
+- **Domains**: Oner reseller adapter (dry-run + HTTP drivers; wire paths
+  `TODO(oner-verify)` — docs.oner.co.za unreachable from the sandbox),
+  registration wizard with zone-provisioned-before-delegation (§4b), ZARC
+  lifecycle states + grace/redemption banners, nameservers (full/partial),
+  transfer lock, WHOIS privacy, auto-renew, registrant contacts, renew,
+  status sync, EPP retrieval behind password step-up (audited).
+- **DNS doctor**: expected records + live verdicts (pass/fail/unverifiable)
+  with per-provider publish instructions (konsoleH, ClientZone,
+  Domains.co.za, Truehost, Cloudflare) and copy buttons.
+- **Migration**: IMAP assistant end-to-end (sealed source credentials,
+  inventory, deliver-then-move through the real ingest pipeline,
+  pause/resume/cancel between items, attention list).
+- **Storage**: per-folder breakdown, largest messages, cleanup suggestions.
+- **Billing**: invoices with derived per-line 15% VAT, SM-YYYY-#### numbers,
+  Paystack initialise/verify + masked card capture, payment history, org
+  billing contact; unconfigured charging = honest 501 (dev manual capture).
+- **Frontend**: four new surfaces (domains list/wizard/dashboard, migration,
+  storage, billing); `/settings/domains` route fixed (phase-10 404).
+
+**Owner decisions unchanged**: sending gated on approval; mail never
+auto-deleted; Z1 S3 = config (phase-8 driver); POPIA review stays manual.
 
 *End of document.*
