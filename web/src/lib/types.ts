@@ -949,3 +949,165 @@ export interface TlsRptState {
 
 // ===== Part 4 type extensions (reply-from aliases, org hints) =====
 declare module './types' {}
+
+// ===== Phase 11 — domains, billing, storage, migration =====
+
+// Registrar-managed domain lifecycle (migration 009).
+export type DomainLifecycle = 'ok' | 'add_grace' | 'renew_grace' | 'redemption' | 'pending_delete' | 'expired';
+export type RegistryStatus = 'ok' | 'pending_create' | 'pending_update' | 'client_hold' | 'server_hold';
+export type ManagedMode = 'unmanaged' | 'full' | 'partial';
+
+export interface DomainRegistrarInfo {
+  registrar: string;
+  registrar_domain_id?: string;
+  registry_status: RegistryStatus;
+  lifecycle: DomainLifecycle;
+  registered_at?: ISODateString;
+  renews_until?: ISODateString;
+  auto_renew: boolean;
+  transfer_lock: boolean;
+  whois_privacy: boolean;
+  epp_code_last_at?: ISODateString;
+  registrant?: Partial<RegistrantContact>;
+  nameservers: string[];
+  managed_mode: ManagedMode;
+  last_status_sync_at?: ISODateString;
+}
+
+export interface RegistrantContact {
+  organisation?: string;
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone?: string;
+  street?: string;
+  city?: string;
+  province?: string;
+  postal_code?: string;
+  country_code: string;
+}
+
+export interface DomainDetail {
+  domain: Domain & { dkim_selector?: string; expires_at?: ISODateString };
+  registrar: DomainRegistrarInfo;
+  grace_note: string;
+  partially_managed: boolean;
+}
+
+export type DoctorVerdict = 'pass' | 'fail' | 'unverifiable';
+
+export interface DoctorCheck {
+  record: string;
+  expected: string;
+  actual: string;
+  verdict: DoctorVerdict;
+  fix: string;
+}
+
+export interface DomainDoctor {
+  domain: string;
+  records: { type: string; name: string; value: string; purpose: string }[];
+  checks: DoctorCheck[];
+  zone: { managed: ManagedMode; nameservers: string[] };
+  checked_at: ISODateString;
+}
+
+// Billing (migration 009).
+export interface InvoiceLine {
+  description: string;
+  quantity: number;
+  unit_zar: number;
+  vat_zar: number;
+  total_zar: number;
+}
+
+export interface InvoiceView {
+  id: string;
+  number: string;
+  status: 'open' | 'paid' | 'void';
+  currency: string;
+  subtotal_zar: number;
+  vat_zar: number;
+  total_zar: number;
+  issued_at: ISODateString;
+  due_at?: ISODateString;
+  paid_at?: ISODateString;
+  provider: string;
+  pay_url?: string;
+  lines: InvoiceLine[];
+}
+
+export interface PaymentRecord {
+  id: string;
+  invoice_id?: string;
+  amount_zar: number;
+  currency: string;
+  status: 'pending' | 'success' | 'failed' | 'refunded';
+  provider: string;
+  paid_at?: ISODateString;
+  created_at: ISODateString;
+}
+
+export interface BillingMethod {
+  id: string;
+  provider: string;
+  kind: string;
+  masked: string;
+  holder?: string;
+  exp_month?: number;
+  exp_year?: number;
+  is_default: boolean;
+  created_at: ISODateString;
+}
+
+export interface BillingSummary {
+  subscription: { status: string; trial_ends_at?: ISODateString; current_period_end?: ISODateString };
+  plan: { slug: string; name: string; price_cents: number; mailbox_limit: number; storage_total_mb: number };
+  contact: { billing_email: string; billing_contact_name: string; vat_number: string };
+  payment_methods: BillingMethod[];
+  paystack_configured: boolean;
+  next_invoice_lines: InvoiceLine[];
+}
+
+// Storage usage report.
+export interface StorageReport {
+  totals: { used_bytes: number; included_bytes: number; grace_bytes: number; used_percent: number; full: boolean; beyond_grace: boolean; never_autodelete: boolean };
+  by_folder: { folder: string; mailbox: string; messages: number; bytes: number }[];
+  largest: { id: string; subject: string; size_bytes: number; received_at: ISODateString; mailbox: string; folder: string }[];
+  suggestions: { kind: string; detail: string; count: number; bytes: number; action: string }[];
+}
+
+// IMAP migration assistant.
+export interface MigrationFolder {
+  name: string;
+  total: number;
+  unseen: number;
+  dest: string;
+}
+
+export interface MigrationJobView {
+  id: string;
+  mailbox_id: string;
+  state: 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
+  total_messages: number;
+  migrated: number;
+  failed: number;
+  folder_map: Record<string, string>;
+  last_error?: string;
+  heartbeat_at?: ISODateString;
+  started_at?: ISODateString;
+  completed_at?: ISODateString;
+  created_at: ISODateString;
+}
+
+export interface MigrationItemView {
+  id: string;
+  folder: string;
+  uid: number;
+  subject: string;
+  from: string;
+  size_bytes: number;
+  state: 'pending' | 'migrated' | 'failed' | 'skipped';
+  attempts: number;
+  error?: string;
+}

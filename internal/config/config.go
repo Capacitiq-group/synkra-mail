@@ -42,6 +42,9 @@ type Config struct {
 	// choosing them is the owner's residency sign-off, not a code decision.
 	S3 S3
 
+	Registrar Registrar // domain reseller API (Oner)
+	Paystack  Paystack  // payment provider
+
 	SMTPInAddr     string // inbound MX listener (port 25 prod)
 	SubmissionAddr string // submission listener (ports 465/587 prod; STARTTLS dev)
 	IMAPAddr       string // IMAP listener (port 993 prod)
@@ -150,6 +153,21 @@ type S3 struct {
 	PathStyle bool // bucket-in-path URLs (required by Contabo/MinIO; optional on AWS)
 }
 
+// Registrar (domain reseller API — Oner, docs.oner.co.za) and Paystack
+// (payments). Both are credential-gated integrations: unset keys keep the
+// features in their honest not-configured state (dry-run registrar, invoice
+// without a pay link), production sets them via environment only.
+type Registrar struct {
+	BaseURL string // reseller API base, e.g. https://api.oner.co.za/v1
+	APIKey  string // reseller API key (bearer)
+	DryRun  bool   // no key set: simulate success in dev, never in prod
+}
+
+type Paystack struct {
+	SecretKey string // sk_... — unset: charging disabled, invoices stay open
+	PublicKey string // pk_... — surfaced to the client for inline flows
+}
+
 type Limits struct {
 	// New-org tier (first 7 days / until verified): Section 7.3.
 	NewOrgDaily      int // 100 messages/day per org
@@ -201,6 +219,14 @@ func Load() (*Config, error) {
 			AccessKey: envStr("SYNKRA_MAIL_S3_ACCESS_KEY", ""),
 			SecretKey: envStr("SYNKRA_MAIL_S3_SECRET_KEY", ""),
 			PathStyle: envStr("SYNKRA_MAIL_S3_PATH_STYLE", "true") == "true",
+		},
+		Registrar: Registrar{
+			BaseURL: envStr("SYNKRA_MAIL_REGISTRAR_BASE_URL", "https://api.oner.co.za/v1"),
+			APIKey:  envStr("SYNKRA_MAIL_REGISTRAR_API_KEY", ""),
+		},
+		Paystack: Paystack{
+			SecretKey: envStr("SYNKRA_MAIL_PAYSTACK_SECRET_KEY", ""),
+			PublicKey: envStr("SYNKRA_MAIL_PAYSTACK_PUBLIC_KEY", ""),
 		},
 
 		SMTPInAddr:     envStr("SYNKRA_MAIL_SMTP_IN_ADDR", "127.0.0.1:2025"),

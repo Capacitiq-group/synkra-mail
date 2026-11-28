@@ -33,6 +33,7 @@ import (
 	"synkra.email/mail/internal/ingest"
 	"synkra.email/mail/internal/janitor"
 	"synkra.email/mail/internal/krypto"
+	"synkra.email/mail/internal/migrator"
 	"synkra.email/mail/internal/model"
 	"synkra.email/mail/internal/outbound"
 	"synkra.email/mail/internal/s3blob"
@@ -193,6 +194,41 @@ func main() {
 		imap := imapd.New(cfg, st, authSvc, blobStore, hub)
 		go func() { errCh <- imap.ListenAndServe() }()
 		log.Printf("[imap] listening on %s", cfg.IMAPAddr)
+	}
+
+	// IMAP migration assistant worker (phase 11): polls every 10s for
+	// queued/resumed jobs and processes them one item at a time. Pause/cancel
+	// take effect between items — a message is never half-delivered.
+	if roles["worker"] {
+		migDeps := &migrator.Deps{Store: st, Blobs: blobStore, Cfg: cfg}
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					var job *store.MigrationJob
+					err := st.WithTx(ctx, func(tx store.Tx) error {
+						var e error
+						job, e = store.ClaimNextMigrationJob(ctx, tx)
+						return e
+					})
+					if err != nil || job == nil {
+						continue
+					}
+					finished, perr := migDeps.ProcessJob(ctx, job)
+					if perr != nil {
+						log.Printf("[migrator] job %s error: %v", job.ID, perr)
+					}
+					if finished && job != nil {
+						log.Printf("[migrator] job %s cycle done (state=%s)", job.ID, job.State)
+					}
+				}
+			}
+		}()
+		log.Printf("[migrator] migration worker started (10s poll)")
 	}
 
 	if roles["worker"] {

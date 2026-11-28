@@ -403,3 +403,33 @@ func defaultLookup(ctx context.Context, name string) ([]string, error) {
 // 4b.12 reverse zones: delegated from the IP provider, managed as zones with
 //       kind='reverse' through this same API.
 // 4b.13 wildcards: a Record{Name:"*"} is legal through this API (catch-all).
+
+// EnsureMailReadyZone provisions the authoritative zone for a hosted domain
+// with the full mail-ready template — the wizard's zero-cache path (4b.4 +
+// 4b.5): the zone exists BEFORE delegation so the first lookup after the
+// customer switches nameservers already answers. Idempotent: an existing zone
+// gets its records reconciled (missing records added, existing left alone).
+func (d *PGDnsService) EnsureMailReadyZone(ctx context.Context, in TemplateInput) error {
+	zoneID, err := d.CreateZone(ctx, in.Domain, "customer", nil)
+	if err != nil {
+		return err
+	}
+	_ = zoneID
+	existing, err := d.ListRecords(ctx, in.Domain)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for _, r := range existing {
+		have[r.RRType+"|"+r.Name+"|"+r.RData] = true
+	}
+	for _, rec := range MailReadyRecords(in) {
+		if have[rec.RRType+"|"+rec.Name+"|"+rec.RData] {
+			continue
+		}
+		if _, err := d.PutRecord(ctx, in.Domain, rec); err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -27,6 +27,11 @@ import { TasksRoute } from '@/routes/tasks/TasksRoute';
 import { SharedMailboxListRoute } from '@/routes/shared/SharedMailboxListRoute';
 import { SharedMailboxShellRoute } from '@/routes/shared/SharedMailboxShellRoute';
 import { SharedActivityRoute } from '@/routes/shared/SharedActivityRoute';
+import { DomainsRoute } from '@/routes/domains/DomainsRoute';
+import { DomainDashboardRoute as DomainRegDashboard } from '@/routes/domains/DomainDashboardRoute';
+import { MigrationRoute } from '@/routes/migration/MigrationRoute';
+import { StorageRoute } from '@/routes/storage/StorageRoute';
+import { BillingRoute } from '@/routes/billing/BillingRoute';
 import { DeliverabilityHubRoute } from '@/routes/deliverability/HubRoute';
 import { DomainDashboardRoute } from '@/routes/deliverability/DomainDashboardRoute';
 import { MailTraceRoute } from '@/routes/deliverability/MailTraceRoute';
@@ -84,6 +89,13 @@ export default function App() {
           <Route path="shared/:sharedMailboxId" element={<SharedMailboxShellRoute />} />
           <Route path="shared/:sharedMailboxId/:folderId" element={<SharedMailboxShellRoute />} />
           <Route path="shared/:sharedMailboxId/:folderId/:messageId" element={<SharedMailboxShellRoute />} />
+          {/* Domains & DNS doctor (phase 11) */}
+          <Route path="settings/domains" element={<DomainsRoute />} />
+          <Route path="settings/domains/:domainId" element={<DomainRegDashboard />} />
+          {/* Migration / storage / billing (phase 11) */}
+          <Route path="settings/migration" element={<MigrationRoute />} />
+          <Route path="settings/storage" element={<StorageRoute />} />
+          <Route path="settings/billing" element={<BillingRoute />} />
           {/* Deliverability hub (part 9) */}
           <Route path="settings/deliverability" element={<DeliverabilityHubRoute />} />
           <Route path="settings/deliverability/:domain" element={<DomainDashboardRoute />} />

@@ -7,13 +7,13 @@ import { request, qs, notAvailable, localId, nowIso,
   type DeliverabilityRaw, type DomainRaw, type HealthRaw, type MailboxRaw, type ReliabilityRaw,
   type TraceRaw, type StorageRaw, type QuarantineRaw, type SuppressionRaw, type OrgRaw, type UserViewRaw } from './apiCore'
 import type {
-  AbuseCase, AddressEntry, AuditEvent, BillingPlan, Calendar, CalendarEvent, Contact,
-  ContactGroup, DeliverabilitySummary, DeliveryTrace, Department, DigestPreferences as _dp,
-  DnsDoctorReport, Domain, DsarRequest, FleetStats, HealthScore, ImpersonationSession,
-  Invoice, Mailbox, MigrationJob, Note as _n, OrgProfile, OrgSummary, OrgUser,
-  PaymentMethod, ProcessingRegisterEntry, QueueJob, QuarantineEntry, ReliabilityAlert,
-  SchedulingLink, SharedMailbox, SharedMailboxMember, StorageUsage, SubProcessor,
-  SuppressionEntry, Task, TaskList, ThreadAssignment,
+  AbuseCase, AddressEntry, AuditEvent, Calendar, CalendarEvent, Contact,
+  ContactGroup, DeliverabilitySummary, DeliveryTrace, Department,
+  Domain, DsarRequest, FleetStats, HealthScore, ImpersonationSession,
+  Mailbox, OrgProfile, OrgSummary, OrgUser, ProcessingRegisterEntry, QueueJob,
+  QuarantineEntry, ReliabilityAlert, SchedulingLink, SharedMailbox,
+  SharedMailboxMember, StorageUsage, SubProcessor, SuppressionEntry, Task,
+  TaskList, ThreadAssignment,
 } from './types'
 
 // The static POPIA processing register — truthful entries describing what
@@ -154,36 +154,92 @@ export const apiOrg = {
     await request(`/domains/${id}/verify`, { method: 'POST' })
     return apiOrg.getDomain(id)
   },
-  dnsDoctor: async (id: string): Promise<DnsDoctorReport> => {
-    const dns = await request<{ domain?: string; records?: Record<string, unknown>[] }>(`/domains/${id}/dns`)
-    const domain = await apiOrg.getDomain(id)
-    return {
-      domain: domain.name,
-      checked_at: nowIso(),
-      overall: (dns.records?.length ?? 0) > 0 ? 'pass' : 'warn',
-      records: (dns.records ?? []).map((r) => ({
-        type: String(r.type ?? 'TXT') as DnsRecordCheckType,
-        name: String(r.host ?? r.name ?? ''),
-        value: String(r.value ?? ''),
-        purpose: String(r.purpose ?? 'mail authentication'),
-        status: 'pending' as const,
-      })),
-    }
+  dnsDoctor: async (id: string): Promise<import('./types').DomainDoctor> => {
+    return request<import('./types').DomainDoctor>(`/domains/${id}/doctor`)
   },
-  updateNameservers: () => notAvailable('Nameserver management', 'domain registration (register 10.x)') as never as Promise<Domain>,
-  setTransferLock: () => notAvailable('Transfer lock', 'domain registration (register 10.x)') as never as Promise<Domain>,
-  beginTransferOut: () => notAvailable('Transfer out', 'domain registration (register 10.x)') as never,
-  updateRegistrantContacts: () => notAvailable('Registrant contacts', 'domain registration (register 10.x)') as never as Promise<Domain>,
-  setWhoisPrivacy: () => notAvailable('WHOIS privacy', 'domain registration (register 10.x)') as never as Promise<Domain>,
-  setAutoRenew: () => notAvailable('Auto-renew', 'domain registration (register 10.x)') as never as Promise<Domain>,
+  // ---- registrar-managed lifecycle (phase 11) ----
+  checkDomain: async (names: string[]) => {
+    const r = await request<{ results: { name: string; available: boolean; price?: number }[] }>('/domains/check', {
+      method: 'POST', body: JSON.stringify({ names }),
+    })
+    return r.results
+  },
+  registerDomain: async (input: { name: string; years: number; ns_mode: 'synkra' | 'custom'; custom_nameservers?: string[]; registrant: import('./types').RegistrantContact }) => {
+    const r = await request<{ domain: string; domain_id: string; zone_provisioned: boolean; zone_error?: string }>('/domains/register', {
+      method: 'POST', body: JSON.stringify(input),
+    })
+    return r
+  },
+  domainDetail: async (id: string): Promise<import('./types').DomainDetail> => {
+    const r = await request<import('./types').DomainDetail>(`/domains/${id}`)
+    return r
+  },
+  syncDomainStatus: async (id: string) => {
+    const r = await request<{ registrar: import('./types').DomainRegistrarInfo }>(`/domains/${id}/sync`, { method: 'POST' })
+    return r.registrar
+  },
+  setNameservers: async (id: string, nameservers: string[]) => {
+    const r = await request<{ nameservers: string[]; managed_mode: string }>(`/domains/${id}/nameservers`, {
+      method: 'PUT', body: JSON.stringify({ nameservers }),
+    })
+    return r
+  },
+  toggleDomainFlag: async (id: string, flag: 'transfer-lock' | 'whois-privacy' | 'auto-renew', enabled: boolean) => {
+    await request(`/domains/${id}/${flag}`, { method: 'POST', body: JSON.stringify({ enabled }) })
+  },
+  updateRegistrant: async (id: string, registrant: import('./types').RegistrantContact) => {
+    const r = await request<{ ok: boolean; note: string }>(`/domains/${id}/registrant`, {
+      method: 'PUT', body: JSON.stringify(registrant),
+    })
+    return r
+  },
+  retrieveEPP: async (id: string, password: string) => {
+    const r = await request<{ epp_code: string }>(`/domains/${id}/epp`, {
+      method: 'POST', body: JSON.stringify({ password }),
+    })
+    return r.epp_code
+  },
+  transferOut: async (id: string, eppCode: string) => {
+    await request(`/domains/${id}/transfer-out`, { method: 'POST', body: JSON.stringify({ epp_code: eppCode }) })
+  },
+  renewDomain: async (id: string, years: number) => {
+    const r = await request<{ renews_until: string; lifecycle: string }>(`/domains/${id}/renew`, {
+      method: 'POST', body: JSON.stringify({ years }),
+    })
+    return r
+  },
 
-  // ===== Migration =====
-  listMigrationJobs: async (): Promise<MigrationJob[]> => [],
-  startMigration: () => notAvailable('IMAP migration', 'migration service (register 13c)') as never as Promise<MigrationJob>,
-  migrationStatus: () => notAvailable('IMAP migration', 'migration service (register 13c)') as never as Promise<MigrationJob>,
-  pauseMigration: () => notAvailable('IMAP migration', 'migration service (register 13c)') as Promise<void>,
-  resumeMigration: () => notAvailable('IMAP migration', 'migration service (register 13c)') as Promise<void>,
-  cancelMigration: () => notAvailable('IMAP migration', 'migration service (register 13c)') as Promise<void>,
+  // ===== IMAP migration assistant (phase 11 — real) =====
+  probeMigrationSource: async (source: { host: string; port: number; security: string; username: string; password: string }) => {
+    const r = await request<{ folders: import('./types').MigrationFolder[] }>('/org/migrations/source-folders', {
+      method: 'POST', body: JSON.stringify(source),
+    })
+    return r.folders
+  },
+  createMigrationJob: async (input: { mailbox_id: string; source: { host: string; port: number; security: string; username: string; password: string }; folder_map: Record<string, string> }) => {
+    const r = await request<{ job: import('./types').MigrationJobView }>('/org/migrations', {
+      method: 'POST', body: JSON.stringify(input),
+    })
+    return r.job
+  },
+  listMigrationJobs: async (): Promise<import('./types').MigrationJobView[]> => {
+    const r = await request<{ jobs: import('./types').MigrationJobView[] }>('/org/migrations')
+    return r.jobs
+  },
+  getMigrationJob: async (id: string, state?: string, offset?: number) => {
+    const qs = state ? `?state=${encodeURIComponent(state)}&offset=${offset ?? 0}` : ''
+    const r = await request<{ job: import('./types').MigrationJobView; items: import('./types').MigrationItemView[] }>(`/org/migrations/${id}${qs}`)
+    return r
+  },
+  migrationAction: async (id: string, action: 'pause' | 'resume' | 'cancel') => {
+    const r = await request<{ job: import('./types').MigrationJobView }>(`/org/migrations/${id}/${action}`, { method: 'POST' })
+    return r.job
+  },
+  deleteMigrationJob: async (id: string) => {
+    await request(`/org/migrations/${id}`, { method: 'DELETE' })
+  },
+  storageReport: async (): Promise<import('./types').StorageReport> =>
+    request<import('./types').StorageReport>('/org/storage/usage'),
 
   // ===== Storage =====
   storage: async (): Promise<StorageUsage> => {
@@ -191,13 +247,45 @@ export const apiOrg = {
     return { used_bytes: raw.used_bytes, quota_bytes: raw.included_bytes + raw.grace_bytes, by_folder: [], largest_messages: [] }
   },
 
-  // ===== Billing (module not shipped) =====
-  billingPlan: async (): Promise<BillingPlan> => notAvailable('Billing plans', 'billing (register 11.x)') as never,
-  invoices: async (): Promise<Invoice[]> => [],
-  invoiceDownloadUrl: (id: string) => { void id; return '#' },
-  paymentMethods: async (): Promise<PaymentMethod[]> => [],
-  setDefaultPaymentMethod: () => notAvailable('Billing', 'billing (register 11.x)') as Promise<void>,
-  removePaymentMethod: () => notAvailable('Billing', 'billing (register 11.x)') as Promise<void>,
+  // ===== Billing (phase 11 — real) =====
+  billingSummary: async (): Promise<import('./types').BillingSummary> =>
+    request<import('./types').BillingSummary>('/org/billing'),
+  updateBillingContact: async (contact: { billing_email: string; billing_contact_name: string; vat_number: string }) => {
+    const r = await request<{ contact: import('./types').BillingSummary['contact'] }>('/org/billing/contact', {
+      method: 'PUT', body: JSON.stringify(contact),
+    })
+    return r.contact
+  },
+  billingPreview: async () => {
+    const r = await request<{ lines: import('./types').InvoiceLine[]; vat_rate: number; total_zar: number }>('/org/billing/preview')
+    return r
+  },
+  createInvoice: async () => {
+    const r = await request<{ invoice: import('./types').InvoiceView }>('/org/billing/invoices', { method: 'POST' })
+    return r.invoice
+  },
+  listInvoices: async () => {
+    const r = await request<{ invoices: import('./types').InvoiceView[]; payments: import('./types').PaymentRecord[] }>('/org/billing/invoices')
+    return r
+  },
+  getInvoice: async (id: string) => {
+    const r = await request<{ invoice: import('./types').InvoiceView }>(`/org/billing/invoices/${id}`)
+    return r.invoice
+  },
+  payInvoice: async (id: string) => {
+    const r = await request<{ pay_url: string; reference: string }>(`/org/billing/invoices/${id}/pay`, { method: 'POST' })
+    return r
+  },
+  verifyInvoice: async (id: string) => {
+    const r = await request<{ verified: boolean; status: string }>(`/org/billing/invoices/${id}/verify`, { method: 'POST' })
+    return r
+  },
+  markInvoicePaid: async (id: string) => {
+    await request(`/org/billing/invoices/${id}/mark-paid`, { method: 'POST' })
+  },
+  removePaymentMethod: async (id: string) => {
+    await request(`/org/billing/payment-methods/${id}`, { method: 'DELETE' })
+  },
 
   // ===== Privacy / POPIA =====
   processingRegister: async (): Promise<ProcessingRegisterEntry[]> => PROCESSING_REGISTER,
@@ -245,8 +333,6 @@ export const apiOrg = {
   createTaskFromMessage: (_input: { message_id?: string; thread_id?: string; list_id?: string; title?: string; notes?: string; due_at?: string; assigned_to?: string }): Promise<Task> => { void _input; return notAvailable('Tasks', 'PIM suite (register 14.x)') },
   getMessageCalendarEvent: async (_messageId: string): Promise<CalendarEvent | null> => { void _messageId; return null },
 }
-
-type DnsRecordCheckType = import('./types').DnsRecordCheck['type']
 
 // ---- org console (nested api.org.*) ----
 
